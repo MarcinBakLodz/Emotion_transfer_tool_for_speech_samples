@@ -1,5 +1,9 @@
+import os
+import torchaudio
 import torch
 import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import torch.nn as nn
 
 class Encoder(torch.nn.Module):
     def __init__(self, in_dim, h_dim, latent_dim):
@@ -58,6 +62,15 @@ class Trainer:
             # Forward pass
             outputs = self.model(inputs)
 
+            # Adjust output size to match input size if necessary
+            if outputs.shape[2] < inputs.shape[2]:
+                # Padding
+                padding_needed = inputs.shape[2] - outputs.shape[2]
+                outputs = torch.nn.functional.pad(outputs, (0, padding_needed))
+            elif outputs.shape[2] > inputs.shape[2]:
+                # Trimming
+                outputs = outputs[:, :, :inputs.shape[2]]
+
             # Compute loss
             loss = self.criterion(outputs, inputs)
 
@@ -81,27 +94,50 @@ class AutoEncoder(torch.nn.Module):
         print("dec: ", x.shape)
         return x
 
-# Example usage:
-if __name__ == "__main__":
-    # Define model parameters
-    in_dim = 1
-    h_dim = 64
-    latent_dim = 512
 
-    # Instantiate the model
-    autoencoder = AutoEncoder(in_dim, h_dim, latent_dim)
 
-    # Define the loss function
-    criterion = torch.nn.MSELoss()
+class RAVDESSDataset(Dataset):
+    def __init__(self, directory, transform=None):
+        self.directory = directory
+        self.filenames = []
+        self.transform = transform
+        self.target_length = 253074
+        
+        for actor in os.listdir(directory):
+            actor_path = os.path.join(directory, actor)
+            if os.path.isdir(actor_path):
+                for filename in os.listdir(actor_path):
+                    self.filenames.append(os.path.join(actor_path, filename))
 
-    # Define the optimizer
-    optimizer = optim.Adam(autoencoder.parameters(), lr=0.001)
+    def __len__(self):
+        return len(self.filenames)
 
-    # Instantiate the trainer
-    trainer = Trainer(autoencoder, criterion, optimizer)
+    def __getitem__(self, idx):
+        audio_path = self.filenames[idx]
+        waveform, sample_rate = torchaudio.load(audio_path, format="wav")
+        # Crop or pad the waveform tensor to the target length
+        if waveform.shape[1] > self.target_length:
+            waveform = waveform[:, :self.target_length]  # Truncate the waveform
+        elif waveform.shape[1] < self.target_length:
+            padding_needed = self.target_length - waveform.shape[1]
+            waveform = nn.functional.pad(waveform, (0, padding_needed))  # Pad with zeros on the last dimension
+        return waveform
 
-    # Generate some dummy input and target data
-    input_data = torch.randn(32, in_dim, 400)  # Batch size 32, input dimension 1, sequence length 100
+data_path = "./datasets/RAVDESS"
 
-    # Train the autoencoder
-    trainer.train(input_data)
+audio_dataset = RAVDESSDataset(data_path)
+
+batch_size = 16
+data_loader = DataLoader(audio_dataset, batch_size=batch_size, shuffle=True)
+
+
+autoencoder = AutoEncoder(in_dim=1, h_dim=64, latent_dim=512)
+criterion = torch.nn.MSELoss()
+optimizer = optim.Adam(autoencoder.parameters(), lr=0.001)
+trainer = Trainer(autoencoder, criterion, optimizer)
+
+for epoch in range(10):
+    for inputs in data_loader:
+        # You might need to adjust the input dimensions or preprocessing based on your network and data
+        # inputs = inputs.view(inputs.size(0), 1, -1)  # Ensure input is in the correct shape
+        trainer.train(inputs)
