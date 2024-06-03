@@ -312,7 +312,6 @@ class RandomAudioDataset(Dataset):
 # Setup models, optimizers, and other components
 in_dim = 1
 h_dim = 64
-latent_dim = 512
 
 encoder = SoundStreamEncoder(in_dim, h_dim).to(device)
 decoder = SoundStreamDecoder(h_dim, in_dim).to(device)
@@ -325,7 +324,7 @@ adv_criterion = nn.BCELoss().to(device)
 lit_autoencoder = LitAutoEncoder(autoencoder, spec_discriminator, criterion, adv_criterion)
 
 # Load data
-data_path = "/content/drive/MyDrive/EmotionTransfer/Data/RAVDES"
+data_path = "./RAVDES"
 audio_dataset = RAVDESSDataset(data_path)
 batch_size = 16
 train_size = int(0.9 * len(audio_dataset))
