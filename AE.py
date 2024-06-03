@@ -1,68 +1,144 @@
-from comet_ml import Experiment
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import CometLogger
 import torch
 import torch.optim as optim
 import torch.nn as nn
 import torchaudio
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, random_split
 import numpy as np
 from torchvision.transforms import Compose
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 import os
+from pytorch_lightning.callbacks import EarlyStopping
 
 ### SETTINGS
 train_on_syntetic_data = False
 log_on_comet = True
 batch_size = 16
 debug = False
-###
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-class Encoder(nn.Module):
-    def __init__(self, in_dim, h_dim, latent_dim):
+class CausalConv1d(torch.nn.Conv1d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.causal_padding = self.dilation[0] * (self.kernel_size[0] - 1)
+
+    def forward(self, x):
+        return self._conv_forward(torch.nn.functional.pad(x, [self.causal_padding, 0]), self.weight, self.bias)
+
+
+class SoundStreamResidualUnit(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, dilation):
         super().__init__()
-        self.conv_stack = nn.Sequential(
-            nn.Conv1d(in_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(h_dim, latent_dim, kernel_size=4, stride=2, padding=1),
+
+        self.dilation = dilation
+
+        self.layers = torch.nn.Sequential(
+            CausalConv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=7, dilation=dilation),
+            torch.nn.ELU(),
+            torch.nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
         )
 
     def forward(self, x):
-        return self.conv_stack(x)
+        return x + self.layers(x)
 
-
-class Decoder(nn.Module):
-    def __init__(self, in_dim, h_dim):
+class SoundStreamEncoderBlock(torch.nn.Module):
+    def __init__(self, out_channels, stride):
         super().__init__()
-        self.inverse_conv_stack = nn.Sequential(
-            nn.ConvTranspose1d(in_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(h_dim, h_dim, kernel_size=5, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(h_dim, h_dim, kernel_size=5, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(h_dim, 1, kernel_size=4, stride=2, padding=1)
+
+        self.layers = torch.nn.Sequential(
+            SoundStreamResidualUnit(in_channels=out_channels//2, out_channels=out_channels//2, dilation=1),
+            torch.nn.ELU(),
+            SoundStreamResidualUnit(in_channels=out_channels//2, out_channels=out_channels//2, dilation=3),
+            torch.nn.ELU(),
+            SoundStreamResidualUnit(in_channels=out_channels//2, out_channels=out_channels//2, dilation=9),
+            torch.nn.ELU(),
+            CausalConv1d(in_channels=out_channels//2, out_channels=out_channels, kernel_size=2*stride, stride=stride)
         )
 
     def forward(self, x):
-        return self.inverse_conv_stack(x)
+        return self.layers(x)
 
+class SoundStreamEncoder(torch.nn.Module):
+    def __init__(self, C, D):
+        super().__init__()
+
+        self.layers = torch.nn.Sequential(
+            CausalConv1d(in_channels=1, out_channels=C, kernel_size=7),
+            torch.nn.ELU(),
+            SoundStreamEncoderBlock(out_channels=2*C, stride=2),
+            torch.nn.ELU(),
+            SoundStreamEncoderBlock(out_channels=4*C, stride=4),
+            torch.nn.ELU(),
+            SoundStreamEncoderBlock(out_channels=8*C, stride=5),
+            torch.nn.ELU(),
+            SoundStreamEncoderBlock(out_channels=16*C, stride=7),
+            torch.nn.ELU(),
+            CausalConv1d(in_channels=16*C, out_channels=D, kernel_size=3)
+        )
+
+    def forward(self, x):
+        y = self.layers(x)
+        return y
+
+class CausalConvTranspose1d(torch.nn.ConvTranspose1d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.causal_padding = self.dilation[0] * (self.kernel_size[0] - 1) + self.output_padding[0] + 1 - self.stride[0]
+
+    def forward(self, x, output_size=None):
+        if self.padding_mode != 'zeros':
+            raise ValueError('Only `zeros` padding mode is supported for ConvTranspose1d')
+
+        assert isinstance(self.padding, tuple)
+        output_padding = self._output_padding(x, output_size, self.stride, self.padding, self.kernel_size, self.dilation)
+        return torch.nn.functional.conv_transpose1d(x, self.weight, self.bias, self.stride, self.padding, output_padding, self.groups, self.dilation)[..., :-self.causal_padding]
+
+class SoundStreamDecoderBlock(torch.nn.Module):
+    def __init__(self, out_channels, stride):
+        super().__init__()
+
+        self.layers = torch.nn.Sequential(
+            CausalConvTranspose1d(in_channels=2*out_channels, out_channels=out_channels, kernel_size=2*stride, stride=stride),
+            torch.nn.ELU(),
+            SoundStreamResidualUnit(in_channels=out_channels, out_channels=out_channels, dilation=1),
+            torch.nn.ELU(),
+            SoundStreamResidualUnit(in_channels=out_channels, out_channels=out_channels, dilation=3),
+            torch.nn.ELU(),
+            SoundStreamResidualUnit(in_channels=out_channels, out_channels=out_channels, dilation=9),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+class SoundStreamDecoder(torch.nn.Module):
+    def __init__(self, C, D):
+        super().__init__()
+
+        self.layers = torch.nn.Sequential(
+            CausalConv1d(in_channels=D, out_channels=16*C, kernel_size=7),
+            torch.nn.ELU(),
+            SoundStreamDecoderBlock(out_channels=8*C, stride=2),
+            torch.nn.ELU(),
+            SoundStreamDecoderBlock(out_channels=4*C, stride=4),
+            torch.nn.ELU(),
+            SoundStreamDecoderBlock(out_channels=2*C, stride=5),
+            torch.nn.ELU(),
+            SoundStreamDecoderBlock(out_channels=C, stride=7),
+            torch.nn.ELU(),
+            CausalConv1d(in_channels=C, out_channels=1, kernel_size=7),
+            nn.Conv1d(1, 1, 205, padding = 1, stride = 1)
+        )
+
+    def forward(self, x):
+        y = self.layers(x)
+        return y
 
 class SPECDiscriminator(nn.Module):
     def __init__(self, n_samples=253074, sample_rate=16000):
         super(SPECDiscriminator, self).__init__()
         self.spectrogram_transform = Compose([
-            MelSpectrogram(sample_rate=sample_rate, n_fft=1024, hop_length=128, n_mels=128),
+            MelSpectrogram(sample_rate=sample_rate, n_fft=1024, hop_length=128, n_mels=128).to(device),
             AmplitudeToDB()
         ])
 
@@ -91,123 +167,107 @@ class SPECDiscriminator(nn.Module):
         )
 
     def forward(self, audio_waveform):
+        audio_waveform = audio_waveform.to(device)
         spectrogram = self.spectrogram_transform(audio_waveform)
-        print(spectrogram.shape)
         out = self.model(spectrogram)
         out = out.view(out.shape[0], -1)
         validity = self.adv_layer(out)
         return validity
-
-
-class Trainer:
-    def __init__(self, autoencoder, spec_discriminator, spec_d_optimizer, ae_optimizer, criterion, adv_criterion, experiment, data_loader):
+    
+class LitAutoEncoder(pl.LightningModule):
+    def __init__(self, autoencoder, spec_discriminator, criterion, adv_criterion):
+        super().__init__()
         self.autoencoder = autoencoder
         self.spec_discriminator = spec_discriminator
-        self.ae_optimizer = ae_optimizer
-        self.spec_d_optimizer = spec_d_optimizer
         self.criterion = criterion
         self.adv_criterion = adv_criterion
-        self.experiment = experiment
-        self.data_loader = data_loader
         self.mel_transform = Compose([
             MelSpectrogram(sample_rate=16000, n_fft=1024, hop_length=128, n_mels=128),
             AmplitudeToDB()
         ])
+        self.automatic_optimization = False  # Disable automatic optimization
 
+    def forward(self, x):
+        return self.autoencoder(x)
 
-    def train(self, epochs=10):
-        for epoch in range(epochs):
-            for batch_idx, inputs in enumerate(self.data_loader):
-                batch_size = inputs.size(0)
+    def training_step(self, batch, batch_idx):
+        inputs = batch
+        batch_size = inputs.size(0)
+        real_labels = torch.ones(batch_size, 1).to(self.device)
+        fake_labels = torch.zeros(batch_size, 1).to(self.device)
 
-                # Train Discriminator
-                self.spec_d_optimizer.zero_grad()
+        # Get optimizers
+        spec_d_optimizer, ae_optimizer = self.optimizers()
 
-                # Forward pass for real inputs
-                real_validity = self.spec_discriminator(inputs)
-                real_labels = torch.ones(batch_size, 1)
-                spec_d_real_loss = self.adv_criterion(real_validity, real_labels)
+        # Train Discriminator
+        spec_d_optimizer.zero_grad()
+        real_validity = self.spec_discriminator(inputs)
+        spec_d_real_loss = self.adv_criterion(real_validity, real_labels)
 
-                # Forward pass for fake inputs
-                outputs = self.autoencoder(inputs)
-                fake_validity = self.spec_discriminator(outputs.detach())
-                fake_labels = torch.zeros(batch_size, 1)
-                spec_d_fake_loss = self.adv_criterion(fake_validity, fake_labels)
+        outputs = self.autoencoder(inputs)
+        fake_validity = self.spec_discriminator(outputs.detach())
+        spec_d_fake_loss = self.adv_criterion(fake_validity, fake_labels)
 
-                # Compute Discriminator loss
-                spec_d_loss = (spec_d_real_loss + spec_d_fake_loss) / 2
-                spec_d_loss.backward()
-                self.spec_d_optimizer.step()
+        spec_d_loss = (spec_d_real_loss + spec_d_fake_loss) / 2
+        self.log("spec_d_loss", spec_d_loss)
+        self.manual_backward(spec_d_loss)
+        spec_d_optimizer.step()
 
-                # Train Autoencoder
-                self.ae_optimizer.zero_grad()
-                outputs = self.autoencoder(inputs)
-                ae_loss = self.criterion(outputs, inputs)
-                
-                # Generator loss
-                fake_validity = self.spec_discriminator(outputs)
-                generation_spec_loss = self.adv_criterion(fake_validity, real_labels)
-                ae_g_loss = ae_loss + generation_spec_loss
-                ae_g_loss.backward()
-                self.ae_optimizer.step()
+        # Train Autoencoder
+        ae_optimizer.zero_grad()
+        outputs = self.autoencoder(inputs)
+        ae_loss = self.criterion(outputs, inputs)
+        fake_validity = self.spec_discriminator(outputs)
+        generation_spec_loss = self.adv_criterion(fake_validity, real_labels)
+        ae_g_loss = ae_loss + generation_spec_loss
+        self.log("ae_loss", ae_loss)
+        self.log("generation_spec_loss", generation_spec_loss)
+        self.log("ae_g_loss", ae_g_loss)
+        self.manual_backward(ae_g_loss)
+        ae_optimizer.step()
 
-                # Logging every 5 batches
-                if batch_idx % 5 == 0:
-                    input_audio = inputs.cpu().detach().numpy().astype(np.float32)
-                    output_audio = outputs.cpu().detach().numpy().astype(np.float32)
-                    self.experiment.log_audio(audio_data=input_audio[0][0], sample_rate=16000, file_name=f'train_epoch_{epoch}_{batch_idx}.wav')
-                    self.experiment.log_audio(audio_data=output_audio[0][0], sample_rate=16000, file_name=f'train_epoch_{epoch}_{batch_idx}_recons.wav')
-                    
-                    input_spectrogram = self.mel_transform(torch.tensor(input_audio[0][0])).cpu().detach().numpy()
-                    output_spectrogram = self.mel_transform(torch.tensor(output_audio[0][0])).cpu().detach().numpy()
-                    self.experiment.log_image(image_data=input_spectrogram, name=f'train_epoch_{epoch}_{batch_idx}_spec.png')
-                    self.experiment.log_image(image_data=output_spectrogram, name=f'train_epoch_{epoch}_{batch_idx}_recons_spec.png')
+        if batch_idx % 5 == 0:
+            input_audio = inputs.cpu().detach().numpy().astype(np.float32)
+            output_audio = outputs.cpu().detach().numpy().astype(np.float32)
+            input_spectrogram = self.mel_transform(torch.tensor(input_audio[0][0])).cpu().detach().numpy()
+            output_spectrogram = self.mel_transform(torch.tensor(output_audio[0][0])).cpu().detach().numpy()
 
-                # Logging losses to Comet
-                self.experiment.log_metric("spec_d_loss", spec_d_loss.item(), step=epoch * len(self.data_loader) + batch_idx)
-                self.experiment.log_metric("ae_loss", ae_loss.item(), step=epoch * len(self.data_loader) + batch_idx)
-                self.experiment.log_metric("generation_spec_loss", generation_spec_loss.item(), step=epoch * len(self.data_loader) + batch_idx)
-                self.experiment.log_metric("ae_g_loss", ae_g_loss.item(), step=epoch * len(self.data_loader) + batch_idx)
+            self.logger.experiment.log_audio(audio_data=input_audio[0][0], sample_rate=16000, file_name=f'train_batch_{batch_idx}.wav')
+            self.logger.experiment.log_audio(audio_data=output_audio[0][0], sample_rate=16000, file_name=f'train_batch_{batch_idx}_recons.wav')
+            self.logger.experiment.log_image(image_data=input_spectrogram, name=f'train_batch_{batch_idx}_spec.png')
+            self.logger.experiment.log_image(image_data=output_spectrogram, name=f'train_batch_{batch_idx}_recons_spec.png')
 
-                print(f"Epoch [{epoch + 1}/{epochs}], Batch [{batch_idx}/{len(self.data_loader)}], SPEC_D Loss: {spec_d_loss.item()}, AE Loss: {ae_loss.item()}, SPEC_G Loss: {generation_spec_loss.item()}")
+        return ae_g_loss
 
-# Setup code to initialize models, optimizers, and other components
-def setup_training(train_on_synthetic_data):
-    in_dim = 1
-    h_dim = 64
-    latent_dim = 512
-    sample_rate = 16000
+    def validation_step(self, batch, batch_idx):
+        inputs = batch
+        outputs = self(inputs)
 
-    encoder = Encoder(in_dim, h_dim, latent_dim)
-    decoder = Decoder(latent_dim, h_dim)
-    autoencoder = nn.Sequential(encoder, decoder)
+        if outputs.shape[2] < inputs.shape[2]:
+            padding_needed = inputs.shape[2] - outputs.shape[2]
+            outputs = torch.nn.functional.pad(outputs, (0, padding_needed))
+        elif outputs.shape[2] > inputs.shape[2]:
+            outputs = outputs[:, :, :inputs.shape[2]]
 
-    spec_discriminator = SPECDiscriminator()
-    
-    ae_optimizer = optim.Adam(autoencoder.parameters(), lr=0.0003, betas=(0.5, 0.999))
-    spec_d_optimizer = optim.Adam(spec_discriminator.parameters(), lr=0.0003, betas=(0.5, 0.999))
+        loss = self.criterion(outputs, inputs)
+        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
-    criterion = nn.MSELoss()
-    adv_criterion = nn.BCELoss()
+        input_audio = inputs.cpu().detach().numpy().astype(np.float32)
+        output_audio = outputs.cpu().detach().numpy().astype(np.float32)
+        input_spectrogram = self.mel_transform(torch.tensor(input_audio[0][0])).cpu().detach().numpy()
+        output_spectrogram = self.mel_transform(torch.tensor(output_audio[0][0])).cpu().detach().numpy()
 
-    if log_on_comet:
-        experiment = Experiment(api_key="usL9bE10QIu6K7Dokovu2MU3s",
-                            project_name="emotional-speech")
-    else:
-       experiment = Experiment(api_key="NON_EXISTING_API_KEY",
-                            project_name="WASD")
+        self.logger.experiment.log_audio(audio_data=input_audio[0][0], sample_rate=16000, file_name=f'val_batch_{batch_idx}.wav')
+        self.logger.experiment.log_audio(audio_data=output_audio[0][0], sample_rate=16000, file_name=f'val_batch_{batch_idx}_recons.wav')
+        self.logger.experiment.log_image(image_data=input_spectrogram, name=f'val_batch_{batch_idx}_spec.png')
+        self.logger.experiment.log_image(image_data=output_spectrogram, name=f'val_batch_{batch_idx}_recons_spec.png')
 
-    
-    if train_on_syntetic_data == False:
-        data_path = "/content/drive/MyDrive/EmotionTransfer/Data/RAVDES"
-        audio_dataset = RAVDESSDataset(data_path)
-    else:
-        audio_dataset = RandomAudioDatase(50)
+        return loss
 
-    data_loader = DataLoader(audio_dataset, batch_size=batch_size, shuffle=True)
-    
-    trainer = Trainer(autoencoder, spec_discriminator, spec_d_optimizer, ae_optimizer, criterion, adv_criterion, experiment, data_loader)
-    return trainer
+    def configure_optimizers(self):
+        ae_optimizer = optim.Adam(self.autoencoder.parameters(), lr=0.0003, betas=(0.5, 0.999))
+        spec_d_optimizer = optim.Adam(self.spec_discriminator.parameters(), lr=0.0003, betas=(0.5, 0.999))
+        return [spec_d_optimizer, ae_optimizer]
 
 
 class RAVDESSDataset(Dataset):
@@ -229,30 +289,63 @@ class RAVDESSDataset(Dataset):
     def __getitem__(self, idx):
         audio_path = self.filenames[idx]
         waveform, sample_rate = torchaudio.load(audio_path, format="wav")
-        # Crop or pad the waveform tensor to the target length
         if waveform.shape[1] > self.target_length:
-            waveform = waveform[:, :self.target_length]  # Truncate the waveform
+            waveform = waveform[:, :self.target_length]
         elif waveform.shape[1] < self.target_length:
             padding_needed = self.target_length - waveform.shape[1]
-            waveform = nn.functional.pad(waveform, (0, padding_needed))  # Pad with zeros on the last dimension
-        return waveform
+            waveform = nn.functional.pad(waveform, (0, padding_needed))
+        return waveform.to(device)
 
-class RandomAudioDatase(Dataset):
-    def __init__(self, num_samples, target_lenght = 84358):
+class RandomAudioDataset(Dataset):
+    def __init__(self, num_samples, target_length=84358):
         self.num_samples = num_samples
-        self.target_length = target_lenght
+        self.target_length = target_length
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, index):
-        waveform = torch.rand(1,self.target_length)
+        waveform = torch.rand(1, self.target_length).to(device)
         return waveform
+    
+    
+# Setup models, optimizers, and other components
+in_dim = 1
+h_dim = 64
+latent_dim = 512
 
+encoder = SoundStreamEncoder(in_dim, h_dim).to(device)
+decoder = SoundStreamDecoder(h_dim, in_dim).to(device)
+autoencoder = nn.Sequential(encoder, decoder).to(device)
+spec_discriminator = SPECDiscriminator().to(device)
 
+criterion = nn.MSELoss().to(device)
+adv_criterion = nn.BCELoss().to(device)
 
-# Initialize and start training
-trainer = setup_training(train_on_syntetic_data)
-trainer.train(epochs=10)
-experiment.end()
+lit_autoencoder = LitAutoEncoder(autoencoder, spec_discriminator, criterion, adv_criterion)
 
+# Load data
+data_path = "/content/drive/MyDrive/EmotionTransfer/Data/RAVDES"
+audio_dataset = RAVDESSDataset(data_path)
+batch_size = 16
+train_size = int(0.9 * len(audio_dataset))
+val_size = len(audio_dataset) - train_size
+train_dataset, val_dataset = random_split(audio_dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+# Setup Comet Logger
+comet_logger = CometLogger(
+    api_key="<HIDDEN>",
+    project_name="Emotional_speech"
+)
+
+early_stopping_callback = EarlyStopping(
+    monitor='val_loss',
+    patience=20,
+    mode='min'
+)
+# Training
+trainer = pl.Trainer(logger=comet_logger, max_epochs=100, callbacks=[early_stopping_callback])
+trainer.fit(lit_autoencoder, train_loader, val_loader)
