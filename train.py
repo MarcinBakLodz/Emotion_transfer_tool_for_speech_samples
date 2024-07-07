@@ -6,21 +6,29 @@ from pytorch_lightning.loggers import CometLogger
 import torch
 from torchinfo import summary
 
-from datasets.vctk import VCTK
-from models.ae import AE, SoundStreamAE
-from models.vqvae import VQVAE, SoundStreamVQVAE
+from datasets.ravdess import RAVDESS
+from models.vqvae import VQVAE
 from utils import get_parser_from_json
 
 
 def get_dset(train_share=0.8):
-    dset = VCTK(root_dir='../data')
+    # dset = VCTK(root_dir='../data')
+    dset = RAVDESS(root_dir='../data/RAVDESS')
     train_size = int(train_share * len(dset))
     test_size = len(dset) - train_size
     return torch.utils.data.random_split(dataset=dset, lengths=[train_size, test_size], generator=torch.Generator().manual_seed(42))  # fix the generator for reproducible results
 
+def get_api_key(file_path):
+    with open(file_path, 'r') as file:
+        file_content = file.read()
+    return file_content
 
-def set_up_comet_logger(model, test_sample):
-    comet_logger = CometLogger()  # https://www.comet.com/docs/v2/api-and-sdk/python-sdk/reference/Experiment/
+def set_up_comet_logger(model, model_config, test_sample, tags):
+    comet_logger = CometLogger(get_api_key("../comet_key.txt"))  # https://www.comet.com/docs/v2/api-and-sdk/python-sdk/reference/Experiment/
+    comet_logger.log_hyperparams(vars(model_config))
+
+    for tag in tags:
+        comet_logger.experiment.add_tag(tag)
 
     # log code
     for file in [f for f in os.listdir(os.path.curdir) if (f.endswith('.py') or f.endswith('.yml'))]:
@@ -50,20 +58,20 @@ def set_up_callbacks(experiment_key, es_min_delta=1e-9, es_patience=50, chckpt_s
 
 
 def training():
-    model_config = get_parser_from_json('models/vqvae_sound_stream_config.json')
-    model = SoundStreamVQVAE(args_dict=vars(model_config))
+    model_config = get_parser_from_json('models/vqvae_config.json')
+    model = VQVAE(args_dict=vars(model_config))
 
     train_dataset, test_dataset = get_dset()
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True, num_workers=os.cpu_count())
-    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True,  pin_memory=True, num_workers=os.cpu_count())
+    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True, pin_memory=True, num_workers=os.cpu_count())
 
-    comet_logger = set_up_comet_logger(model=model, test_sample=next(iter(test_loader)))
+    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=['VQVAE', 'RAVDESS', 'LeakyReLU', 'NEAREST'])
 
     trainer = Trainer(callbacks=set_up_callbacks(comet_logger.experiment.get_key()),  # https://lightning.ai/docs/pytorch/stable/common/trainer.html#
                       logger=comet_logger,
                       log_every_n_steps=10,
                       accelerator='auto',
-                      devices='auto',
+                      devices=[1],
                       precision='32-true',
                       max_epochs=1000)
 

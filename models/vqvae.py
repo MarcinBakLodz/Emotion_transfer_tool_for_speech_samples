@@ -6,7 +6,13 @@ from pytorch_lightning.utilities import rank_zero_only
 import torch
 from torchaudio.transforms import AmplitudeToDB, MelSpectrogram
 from torchvision.transforms import Compose
-from torchmetrics.audio import PerceptualEvaluationSpeechQuality, ShortTimeObjectiveIntelligibility
+try:
+    from torchmetrics.audio import PerceptualEvaluationSpeechQuality, ShortTimeObjectiveIntelligibility
+except ImportError:
+    print("imported PerceptualEvaluationSpeechQuality from pesq")
+    from torchmetrics.audio.pesq import PerceptualEvaluationSpeechQuality
+    from torchmetrics.audio.stoi import ShortTimeObjectiveIntelligibility
+
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from models.layers import Decoder, Encoder, VectorQuantizer, SoundStreamEncoder, SoundStreamDecoder

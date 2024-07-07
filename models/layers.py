@@ -1,5 +1,6 @@
 import torch
-
+from torchvision.transforms import Compose
+from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
 # source: https://github.com/MishaLaskin/vqvae/blob/master/main.py
 class VectorQuantizer(torch.nn.Module):
@@ -127,23 +128,55 @@ class VectorQuantizer(torch.nn.Module):
         return loss, z_q, perplexity, min_encodings, min_encoding_indices
 
 
+class ResidualBlock(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, activation=torch.nn.LeakyReLU(inplace=True), stride=2):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = torch.nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
+        self.activation = activation
+        self.conv2 = torch.nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.downsample = torch.nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
+
+    def forward(self, x):
+        residual = self.downsample(x)
+        out = self.conv1(x)
+        out = self.activation(out)
+        out = self.conv2(out)
+        out += residual
+        out = self.activation(out)
+        return out
+
+
+class UpsampleResidualBlock(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, activation=torch.nn.LeakyReLU(inplace=True), stride=2):
+        super(UpsampleResidualBlock, self).__init__()
+        self.upsample = torch.nn.Upsample(scale_factor=stride, mode='nearest')
+        self.conv1 = torch.nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.activation = activation
+        self.conv2 = torch.nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv3 = torch.nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        residual = self.upsample(x)
+        residual = self.conv3(residual)
+        out = self.conv1(x)
+        out = self.activation(out)
+        out = self.upsample(out)
+        out = self.conv2(out)
+        out += residual
+        out = self.activation(out)
+        return out
+
+
 class Encoder(torch.nn.Module):
     def __init__(self, in_dim, h_dim, latent_dim):
         super().__init__()
         self.conv_stack = torch.nn.Sequential(
-            # 6 strided convolutional layers with stride 2 and window size 4
-            torch.nn.Conv1d(in_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            # the latents consist of one feature map and the discrete space is 512-dimensional
-            torch.nn.Conv1d(h_dim, latent_dim, kernel_size=4, stride=2, padding=1),
+            torch.nn.Conv1d(in_dim, h_dim, kernel_size=7, padding=3),
+            torch.nn.LeakyReLU(inplace=True),
+            ResidualBlock(h_dim, h_dim),
+            # ResidualBlock(h_dim, h_dim),
+            # ResidualBlock(h_dim, h_dim),
+            torch.nn.Conv1d(h_dim, latent_dim, kernel_size=3, stride=2, padding=1)
         )
 
     def forward(self, x):
@@ -155,19 +188,11 @@ class Decoder(torch.nn.Module):
         super().__init__()
 
         self.inverse_conv_stack = torch.nn.Sequential(
-            torch.nn.Conv1d(in_dim, h_dim, kernel_size=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.ConvTranspose1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.ConvTranspose1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.ConvTranspose1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.ConvTranspose1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.ConvTranspose1d(h_dim, h_dim, kernel_size=4, stride=2, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.ConvTranspose1d(h_dim, 1, kernel_size=4, stride=2, padding=1))
+            UpsampleResidualBlock(in_dim, h_dim),
+            UpsampleResidualBlock(h_dim, h_dim),
+            # UpsampleResidualBlock(h_dim, h_dim),
+            # UpsampleResidualBlock(h_dim, h_dim),
+            torch.nn.Conv1d(h_dim, 1, kernel_size=7, padding=3))
 
     def forward(self, x):
         return self.inverse_conv_stack(x)
@@ -242,11 +267,11 @@ class SoundStreamEncoder(torch.nn.Module):
             torch.nn.ELU(),
             SoundStreamEncoderBlock(out_channels=2*C, stride=2),
             torch.nn.ELU(),
-            SoundStreamEncoderBlock(out_channels=4*C, stride=4),
+            SoundStreamEncoderBlock(out_channels=4*C, stride=2),
             torch.nn.ELU(),
-            SoundStreamEncoderBlock(out_channels=8*C, stride=5),
+            SoundStreamEncoderBlock(out_channels=8*C, stride=2),
             torch.nn.ELU(),
-            SoundStreamEncoderBlock(out_channels=16*C, stride=8),
+            SoundStreamEncoderBlock(out_channels=16*C, stride=2),
             torch.nn.ELU(),
             CausalConv1d(in_channels=16*C, out_channels=D, kernel_size=3)
         )
@@ -282,11 +307,11 @@ class SoundStreamDecoder(torch.nn.Module):
             torch.nn.ELU(),
             SoundStreamDecoderBlock(out_channels=8*C, stride=2),
             torch.nn.ELU(),
-            SoundStreamDecoderBlock(out_channels=4*C, stride=4),
+            SoundStreamDecoderBlock(out_channels=4*C, stride=2),
             torch.nn.ELU(),
-            SoundStreamDecoderBlock(out_channels=2*C, stride=5),
+            SoundStreamDecoderBlock(out_channels=2*C, stride=2),
             torch.nn.ELU(),
-            SoundStreamDecoderBlock(out_channels=C, stride=8),
+            SoundStreamDecoderBlock(out_channels=C, stride=2),
             torch.nn.ELU(),
             CausalConv1d(in_channels=C, out_channels=1, kernel_size=7)
         )
@@ -363,7 +388,6 @@ class ResNet2d(torch.nn.Module):
         x = self.activation(x)
         return x
 
-
 class STFTDiscriminator(torch.nn.Module):
     r"""STFT-based discriminator from https://arxiv.org/pdf/2107.03312.pdf
     """
@@ -399,3 +423,15 @@ class STFTDiscriminator(torch.nn.Module):
         x = torch.unsqueeze(x, dim=1)
         x = self.layers(x)
         return x
+
+
+if __name__ == '__main__':
+    from torchinfo import summary
+
+    sample = torch.randn(size=(1, 32768))
+    enc = Encoder(in_dim=1, h_dim=32, latent_dim=1)
+    summ = summary(enc, input_data=sample.to('cuda'), device='cuda')
+
+    latent = torch.randn(size=(1, 2048))
+    dec = Decoder(in_dim=1, h_dim=32)
+    summ2 = summary(dec, input_data=latent.to('cuda'), device='cuda')
