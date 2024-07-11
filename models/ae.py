@@ -9,7 +9,7 @@ from torchvision.transforms import Compose
 from torchmetrics.audio import PerceptualEvaluationSpeechQuality, ShortTimeObjectiveIntelligibility
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
-from models.layers import Decoder, Encoder, SoundStreamEncoder, SoundStreamDecoder
+from models.layers import Decoder, Encoder, VectorQuantizer, DualLatentEncoder, DualLatentDecoder
 from models.model_utils import skip_if_sanity_checking
 
 
@@ -121,9 +121,78 @@ class AE(LightningModule):
         self.logger.experiment.log_asset(f'../results/{self.logger.experiment.get_key()}/checkpoints/{best_checkpoint}')
 
 
-class SoundStreamAE(AE):
+class VQVAE(AE):
     def __init__(self, args_dict):
-        super().__init__(args_dict)
+        super(VQVAE, self).__init__(args_dict)
 
-        self.encoder = SoundStreamEncoder(C=self.h_dim, D=self.latent_dim)
-        self.decoder = SoundStreamDecoder(C=self.h_dim, D=self.latent_dim)
+        # pass continuous latent vector through discretization bottleneck
+        self.vector_quantization = VectorQuantizer(n_e=self.n_e, e_dim=self.latent_dim, beta=self.beta, check_dims=self.verbose)
+
+    def configure_optimizers(self):
+        self.vector_quantization.set_device(self.device)
+        return super().configure_optimizers()
+
+    def forward(self, x):
+        z_e = self.encoder(x)
+        embedding_loss, z_q, perplexity, _, _ = self.vector_quantization(z_e)
+        x_hat = self.decoder(z_q)
+        return x_hat, embedding_loss, perplexity
+
+    def training_step(self, batch, batch_idx):
+        x_hat, embedding_loss, perplexity = self(batch)
+        recon_loss = self.loss_fn(x_hat, batch)
+
+        self.log_training_step_metrics(recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx)
+
+        return recon_loss + embedding_loss
+
+    def validation_step(self, batch, batch_idx):
+        x_hat, embedding_loss, perplexity = self(batch)
+        recon_loss = self.loss_fn(x_hat, batch)
+
+        self.log_validation_step_metrics(recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx)
+
+        return recon_loss + embedding_loss
+
+    @torch.no_grad()
+    def log_training_step_metrics(self, recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx):
+        super().log_training_step_metrics(recon_loss + embedding_loss, x_hat, batch, batch_idx)
+
+        # Log additional metrics specific to VQVAE
+        self.log('train_reconstruction_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_embedding_loss', embedding_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_perplexity', perplexity, sync_dist=True, batch_size=self.batch_size)
+
+    @torch.no_grad()
+    @skip_if_sanity_checking
+    def log_validation_step_metrics(self, recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx):
+        super().log_validation_step_metrics(recon_loss + embedding_loss, x_hat, batch, batch_idx)
+
+        self.log('val_reconstruction_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_embedding_loss', embedding_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_perplexity', perplexity, sync_dist=True, batch_size=self.batch_size)
+
+
+class DualLatentAE(VQVAE):
+    def __init__(self, args_dict):
+        super(DualLatentAE, self).__init__(args_dict)
+        del self.vector_quantization
+
+        self.encoder = DualLatentEncoder(in_dim=self.in_dim,
+                                         h_dim=self.h_dim,
+                                         cont_latent_dim=self.cont_latent_dim,
+                                         vq_latent_dim=self.vq_latent_dim,
+                                         n_e=self.n_e,
+                                         beta=self.beta,
+                                         verbose=self.verbose)
+
+        self.decoder = DualLatentDecoder(in_dim=self.latent_dim, h_dim=self.h_dim)
+
+    def configure_optimizers(self):
+        self.encoder.vector_quantization[1].set_device(self.device)
+        return AE.configure_optimizers(self)
+
+    def forward(self, x):
+        x, z_q, embedding_loss, perplexity = self.encoder(x)
+        x_hat = self.decoder(x, z_q)
+        return x_hat, embedding_loss, perplexity

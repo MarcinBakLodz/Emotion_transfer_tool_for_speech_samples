@@ -1,7 +1,9 @@
 {
   "in_dim": 1,
   "h_dim": 256,
-  "latent_dim": 10,
+  "cont_latent_dim": 16,
+  "vq_latent_dim": 16,
+  "latent_dim": 32,
   "n_e": 512,
   "beta": 0.25,
   "verbose": false,
