@@ -5,8 +5,8 @@
   "n_e": 512,
   "beta": 0.25,
   "verbose": false,
-  "learning_rate": 3e-4,
-  "weight_decay": 1e-6,
-  "batch_size": 4,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.000001,
+  "batch_size": 16,
   "sr": 16000
 }

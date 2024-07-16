@@ -15,16 +15,23 @@ except ImportError:
 
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
-from models.layers import Decoder, Encoder, SoundStreamEncoder, SoundStreamDecoder
+from models.layers import Decoder, Encoder, VectorQuantizer, SoundStreamEncoder, SoundStreamDecoder, STFTDiscriminator
 from models.model_utils import skip_if_sanity_checking
 
 
-class AE(LightningModule):
+# source: https://github.com/MishaLaskin/vqvae/blob/master/models/vqvae.py
+class VQVAE(LightningModule):  # TODO this perhaps could inherit after AE...? There's quite a lot of duplicated code...
     def __init__(self, args_dict):
-        super().__init__()
+        super(VQVAE, self).__init__()
         self.__dict__.update(args_dict)
 
+        # encode image into continuous latent space
         self.encoder = Encoder(in_dim=self.in_dim, h_dim=self.h_dim, latent_dim=self.latent_dim)
+
+        # pass continuous latent vector through discretization bottleneck
+        self.vector_quantization = VectorQuantizer(n_e=self.n_e, e_dim=self.latent_dim, beta=self.beta, check_dims=self.verbose)
+
+        # decode the discrete latent representation
         self.decoder = Decoder(in_dim=self.latent_dim, h_dim=self.h_dim)
 
         self.mel_transform = Compose([
@@ -47,37 +54,43 @@ class AE(LightningModule):
             if isinstance(transform, torch.nn.Module):
                 transform.to(self.device)
 
+        self.vector_quantization.set_device(self.device)
+
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         return optimizer
 
     def forward(self, x):
         z_e = self.encoder(x)
-        x_hat = self.decoder(z_e)
-        return x_hat
+        embedding_loss, z_q, perplexity, _, _ = self.vector_quantization(z_e)
+        x_hat = self.decoder(z_q)
+        return x_hat, embedding_loss, perplexity
 
     def training_step(self, batch, batch_idx):
-        x_hat = self(batch)
+        x_hat, embedding_loss, perplexity = self(batch)
         recon_loss = self.loss_fn(x_hat, batch)
 
-        self.log_training_step_metrics(recon_loss, x_hat, batch, batch_idx)
+        self.log_training_step_metrics(recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx)
 
-        return recon_loss
+        return recon_loss + embedding_loss
 
     def validation_step(self, batch, batch_idx):
-        x_hat = self(batch)
+        x_hat, embedding_loss, perplexity = self(batch)
         recon_loss = self.loss_fn(x_hat, batch)
 
-        self.log_validation_step_metrics(recon_loss, x_hat, batch, batch_idx)
+        self.log_validation_step_metrics(recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx)
 
-        return recon_loss
+        return recon_loss + embedding_loss
 
     def on_fit_end(self):
         self.log_best_checkpoint()
 
     @torch.no_grad()
-    def log_training_step_metrics(self, recon_loss, x_hat, batch, batch_idx):
-        # log loss
-        self.log('train_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+    def log_training_step_metrics(self, recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx):
+        # log losses
+        self.log('train_reconstruction_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_embedding_loss', embedding_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_loss', recon_loss + embedding_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_perplexity', perplexity, sync_dist=True, batch_size=self.batch_size)
 
         # log image metrics
         self.log('train_ssim', self.ssim(self.mel_transform(x_hat), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
@@ -99,9 +112,12 @@ class AE(LightningModule):
 
     @torch.no_grad()
     @skip_if_sanity_checking
-    def log_validation_step_metrics(self, recon_loss, x_hat, batch, batch_idx):
-        # log loss
-        self.log('val_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+    def log_validation_step_metrics(self, recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx):
+        # log losses
+        self.log('val_reconstruction_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_embedding_loss', embedding_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_loss', recon_loss + embedding_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_perplexity', perplexity, sync_dist=True, batch_size=self.batch_size)
 
         # log image metrics
         self.log('val_ssim', self.ssim(self.mel_transform(x_hat), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
@@ -127,7 +143,7 @@ class AE(LightningModule):
         self.logger.experiment.log_asset(f'../results/{self.logger.experiment.get_key()}/checkpoints/{best_checkpoint}')
 
 
-class SoundStreamAE(AE):
+class SoundStreamVQVAE(VQVAE):
     def __init__(self, args_dict):
         super().__init__(args_dict)
 

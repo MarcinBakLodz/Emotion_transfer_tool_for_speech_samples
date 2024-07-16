@@ -7,21 +7,24 @@ import torch
 from torchinfo import summary
 
 from datasets.ravdess import RAVDESS
-from datasets.vctk import VCTK
-from models.ae import AE, VQVAE, DualLatentAE
+from models.vqvae import VQVAE
 from utils import get_parser_from_json
 
 
 def get_dset(train_share=0.8):
-    # dset = VCTK(root_dir='../data')
-    dset = RAVDESS(root_dir='../data/RAVDESS')
+    dset = RAVDESS(root_dir='./datasets/RAVDESS')
     train_size = int(train_share * len(dset))
     test_size = len(dset) - train_size
     return torch.utils.data.random_split(dataset=dset, lengths=[train_size, test_size], generator=torch.Generator().manual_seed(42))  # fix the generator for reproducible results
 
+def get_comet_config(file_path):
+    with open(file_path, 'r') as file:
+        file_content = file.read().splitlines()
+    return file_content[0], file_content[1]  # API key, Project name
 
 def set_up_comet_logger(model, model_config, test_sample, tags):
-    comet_logger = CometLogger()  # https://www.comet.com/docs/v2/api-and-sdk/python-sdk/reference/Experiment/
+    api_key, project_name = get_comet_config("./comet_config.txt")
+    comet_logger = CometLogger(api_key=api_key, project_name=project_name)  # https://www.comet.com/docs/v2/api-and-sdk/python-sdk/reference/Experiment/
     comet_logger.log_hyperparams(vars(model_config))
 
     for tag in tags:
@@ -55,8 +58,8 @@ def set_up_callbacks(experiment_key, es_min_delta=1e-9, es_patience=50, chckpt_s
 
 
 def training():
-    model_config = get_parser_from_json('models/double_latent_ae_config.json')
-    model = DualLatentAE(args_dict=vars(model_config))
+    model_config = get_parser_from_json('models/vqvae_config.json')
+    model = VQVAE(args_dict=vars(model_config))
 
     train_dataset, test_dataset = get_dset()
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True, num_workers=os.cpu_count())
@@ -68,7 +71,7 @@ def training():
                       logger=comet_logger,
                       log_every_n_steps=10,
                       accelerator='auto',
-                      devices='auto',
+                      devices=[0],
                       precision='32-true',
                       max_epochs=1000)
 

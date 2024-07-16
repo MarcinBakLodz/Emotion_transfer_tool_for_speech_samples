@@ -1,0 +1,2 @@
+from torchmetrics.audio.pesq import PerceptualEvaluationSpeechQuality
+from torchmetrics.audio import ShortTimeObjectiveIntelligibility
