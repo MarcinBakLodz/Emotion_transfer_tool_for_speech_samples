@@ -1,9 +1,11 @@
 {
   "in_dim": 1,
   "h_dim": 256,
+  "disc_h_dim": 16,
   "latent_dim": 1,
-  "learning_rate": 3e-4,
+  "g_learning_rate": 3e-4,
+  "d_learning_rate": 3e-4,
   "weight_decay": 1e-6,
-  "batch_size": 64,
+  "batch_size": 16,
   "sr": 16000
 }

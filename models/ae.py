@@ -1,3 +1,4 @@
+from itertools import chain
 from natsort import os_sorted
 import numpy as np
 import os
@@ -18,8 +19,15 @@ class AE(LightningModule):
         super().__init__()
         self.__dict__.update(args_dict)
 
+        self.automatic_optimization = False
+
         self.encoder = Encoder(in_dim=self.in_dim, h_dim=self.h_dim, latent_dim=self.latent_dim)
         self.decoder = Decoder(in_dim=self.latent_dim, h_dim=self.h_dim)
+        self.wave_discriminator = torch.nn.Sequential(
+            Encoder(in_dim=self.in_dim, h_dim=self.disc_h_dim, latent_dim=self.latent_dim),
+            torch.nn.AdaptiveAvgPool1d(1),  # Reduce feature map size to 1
+            torch.nn.Flatten()  # Remove extra dimensions
+        )
 
         self.mel_transform = Compose([
             MelSpectrogram(sample_rate=self.sr, n_fft=1024, hop_length=128, n_mels=128),
@@ -28,6 +36,7 @@ class AE(LightningModule):
 
         # loss function
         self.loss_fn = torch.nn.MSELoss(reduction='mean')
+        self.disc_loss_fn = torch.nn.BCEWithLogitsLoss(reduction='mean')
 
         # metrics
         self.pesq = PerceptualEvaluationSpeechQuality(fs=self.sr, mode='wb', n_processes=os.cpu_count())  # -> https://lightning.ai/docs/torchmetrics/stable/audio/perceptual_evaluation_speech_quality.html
@@ -41,8 +50,10 @@ class AE(LightningModule):
             if isinstance(transform, torch.nn.Module):
                 transform.to(self.device)
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-        return optimizer
+        optimizer_g = torch.optim.Adam(self.parameters(), lr=self.g_learning_rate, weight_decay=self.weight_decay)
+        optimizer_d = torch.optim.Adam(self.wave_discriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
+
+        return [optimizer_g, optimizer_d], []
 
     def forward(self, x):
         z_e = self.encoder(x)
@@ -50,28 +61,69 @@ class AE(LightningModule):
         return x_hat
 
     def training_step(self, batch, batch_idx):
+        optimizer_g, optimizer_d = self.optimizers()
+
+        # TAKEN FROM: https://github.com/kaiidams/soundstream-pytorch/blob/main/soundstream.py
         x_hat = self(batch)
-        recon_loss = self.loss_fn(x_hat, batch)
 
-        self.log_training_step_metrics(recon_loss, x_hat, batch, batch_idx)
+        # train generator
+        self.toggle_optimizer(optimizer_g)
+        recon_loss = self.loss_fn(x_hat, batch) * 100
 
-        return recon_loss
+        g_output_fake = self.wave_discriminator(x_hat)
+        g_wave_loss = self.disc_loss_fn(g_output_fake, torch.ones_like(g_output_fake))
+        g_loss = recon_loss + g_wave_loss
+
+        self.manual_backward(g_loss)
+        optimizer_g.step()
+        optimizer_g.zero_grad()
+        self.untoggle_optimizer(optimizer_g)
+
+        # train discriminator
+        x_hat = self(batch)
+        self.toggle_optimizer(optimizer_d)
+
+        d_output_real = self.wave_discriminator(batch)
+        d_output_fake = self.wave_discriminator(x_hat)
+
+        d_wave_loss_real = self.disc_loss_fn(d_output_real, torch.ones_like(d_output_real))
+        d_wave_loss_fake = self.disc_loss_fn(d_output_fake, torch.zeros_like(d_output_fake))
+
+        d_wave_loss = (d_wave_loss_real + d_wave_loss_fake) / 2
+
+        self.manual_backward(d_wave_loss)
+        optimizer_d.step()
+        optimizer_d.zero_grad()
+        self.untoggle_optimizer(optimizer_d)
+
+        self.log_training_step_metrics(recon_loss, g_wave_loss, d_wave_loss, x_hat, batch, batch_idx)
 
     def validation_step(self, batch, batch_idx):
         x_hat = self(batch)
         recon_loss = self.loss_fn(x_hat, batch)
 
-        self.log_validation_step_metrics(recon_loss, x_hat, batch, batch_idx)
+        g_output_fake = self.wave_discriminator(x_hat)
+        g_wave_loss = self.disc_loss_fn(g_output_fake, torch.ones_like(g_output_fake))
 
-        return recon_loss
+        d_output_real = self.wave_discriminator(batch)
+        d_output_fake = self.wave_discriminator(x_hat)
+
+        d_wave_loss_real = self.disc_loss_fn(d_output_real, torch.ones_like(d_output_real))
+        d_wave_loss_fake = self.disc_loss_fn(d_output_fake, torch.zeros_like(d_output_fake))
+
+        d_wave_loss = (d_wave_loss_real + d_wave_loss_fake) / 2
+
+        self.log_validation_step_metrics(recon_loss, g_wave_loss, d_wave_loss, x_hat, batch, batch_idx)
 
     def on_fit_end(self):
         self.log_best_checkpoint()
 
     @torch.no_grad()
-    def log_training_step_metrics(self, recon_loss, x_hat, batch, batch_idx):
+    def log_training_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, x_hat, batch, batch_idx):
         # log loss
-        self.log('train_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_g_recons_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
 
         # log image metrics
         self.log('train_ssim', self.ssim(self.mel_transform(x_hat), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
@@ -93,9 +145,11 @@ class AE(LightningModule):
 
     @torch.no_grad()
     @skip_if_sanity_checking
-    def log_validation_step_metrics(self, recon_loss, x_hat, batch, batch_idx):
+    def log_validation_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, x_hat, batch, batch_idx):
         # log loss
-        self.log('val_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_g_recons_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
 
         # log image metrics
         self.log('val_ssim', self.ssim(self.mel_transform(x_hat), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
@@ -126,7 +180,7 @@ class VQVAE(AE):
         super(VQVAE, self).__init__(args_dict)
 
         # pass continuous latent vector through discretization bottleneck
-        self.vector_quantization = VectorQuantizer(n_e=self.n_e, e_dim=self.latent_dim, beta=self.beta, check_dims=self.verbose)
+        self.vector_quantization = VectorQuantizer(n_e=self.n_e, e_dim=self.latent_dim, beta=self.beta)
 
     def configure_optimizers(self):
         self.vector_quantization.set_device(self.device)
@@ -139,36 +193,73 @@ class VQVAE(AE):
         return x_hat, embedding_loss, perplexity
 
     def training_step(self, batch, batch_idx):
+        optimizer_g, optimizer_d = self.optimizers()
+
         x_hat, embedding_loss, perplexity = self(batch)
-        recon_loss = self.loss_fn(x_hat, batch)
+        embedding_loss *= 100
 
-        self.log_training_step_metrics(recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx)
+        # train generator
+        self.toggle_optimizer(optimizer_g)
+        recon_loss = self.loss_fn(x_hat, batch) * 100
 
-        return recon_loss + embedding_loss
+        g_output_fake = self.wave_discriminator(x_hat)
+        g_wave_loss = self.disc_loss_fn(g_output_fake, torch.ones_like(g_output_fake))
+        g_loss = recon_loss + embedding_loss + g_wave_loss
+
+        self.manual_backward(g_loss)
+        optimizer_g.step()
+        optimizer_g.zero_grad()
+        self.untoggle_optimizer(optimizer_g)
+
+        # train discriminator
+        x_hat, *_ = self(batch)
+        self.toggle_optimizer(optimizer_d)
+
+        d_output_real = self.wave_discriminator(batch)
+        d_output_fake = self.wave_discriminator(x_hat)
+
+        d_wave_loss_real = self.disc_loss_fn(d_output_real, torch.ones_like(d_output_real))
+        d_wave_loss_fake = self.disc_loss_fn(d_output_fake, torch.zeros_like(d_output_fake))
+
+        d_wave_loss = (d_wave_loss_real + d_wave_loss_fake) / 2
+
+        self.manual_backward(d_wave_loss)
+        optimizer_d.step()
+        optimizer_d.zero_grad()
+        self.untoggle_optimizer(optimizer_d)
+
+        self.log_training_step_metrics(recon_loss, g_wave_loss, d_wave_loss, embedding_loss, perplexity, x_hat, batch, batch_idx)
 
     def validation_step(self, batch, batch_idx):
         x_hat, embedding_loss, perplexity = self(batch)
         recon_loss = self.loss_fn(x_hat, batch)
 
-        self.log_validation_step_metrics(recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx)
+        g_output_fake = self.wave_discriminator(x_hat)
+        g_wave_loss = self.disc_loss_fn(g_output_fake, torch.ones_like(g_output_fake))
 
-        return recon_loss + embedding_loss
+        d_output_real = self.wave_discriminator(batch)
+        d_output_fake = self.wave_discriminator(x_hat)
+
+        d_wave_loss_real = self.disc_loss_fn(d_output_real, torch.ones_like(d_output_real))
+        d_wave_loss_fake = self.disc_loss_fn(d_output_fake, torch.zeros_like(d_output_fake))
+
+        d_wave_loss = (d_wave_loss_real + d_wave_loss_fake) / 2
+
+        self.log_validation_step_metrics(recon_loss, g_wave_loss, d_wave_loss, embedding_loss, perplexity, x_hat, batch, batch_idx)
 
     @torch.no_grad()
-    def log_training_step_metrics(self, recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx):
-        super().log_training_step_metrics(recon_loss + embedding_loss, x_hat, batch, batch_idx)
+    def log_training_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, embedding_loss, perplexity, x_hat, batch, batch_idx):
+        super().log_training_step_metrics(recon_loss, g_wave_loss, d_wave_loss, x_hat, batch, batch_idx)
 
         # Log additional metrics specific to VQVAE
-        self.log('train_reconstruction_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
         self.log('train_embedding_loss', embedding_loss, sync_dist=True, batch_size=self.batch_size)
         self.log('train_perplexity', perplexity, sync_dist=True, batch_size=self.batch_size)
 
     @torch.no_grad()
     @skip_if_sanity_checking
-    def log_validation_step_metrics(self, recon_loss, embedding_loss, perplexity, x_hat, batch, batch_idx):
-        super().log_validation_step_metrics(recon_loss + embedding_loss, x_hat, batch, batch_idx)
+    def log_validation_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, embedding_loss, perplexity, x_hat, batch, batch_idx):
+        super().log_validation_step_metrics(recon_loss, g_wave_loss, d_wave_loss, x_hat, batch, batch_idx)
 
-        self.log('val_reconstruction_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
         self.log('val_embedding_loss', embedding_loss, sync_dist=True, batch_size=self.batch_size)
         self.log('val_perplexity', perplexity, sync_dist=True, batch_size=self.batch_size)
 
@@ -183,8 +274,7 @@ class DualLatentAE(VQVAE):
                                          cont_latent_dim=self.cont_latent_dim,
                                          vq_latent_dim=self.vq_latent_dim,
                                          n_e=self.n_e,
-                                         beta=self.beta,
-                                         verbose=self.verbose)
+                                         beta=self.beta)
 
         self.decoder = DualLatentDecoder(in_dim=self.latent_dim, h_dim=self.h_dim)
 

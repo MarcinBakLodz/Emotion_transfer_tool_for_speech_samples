@@ -49,20 +49,20 @@ def set_up_comet_logger(model, model_config, test_sample, tags):
 
 
 def set_up_callbacks(experiment_key, es_min_delta=1e-9, es_patience=50, chckpt_save_top_k=5):
-    early_stop_callback = EarlyStopping(monitor='val_loss', min_delta=es_min_delta, patience=es_patience, mode='min')
-    checkpoint_callback = ModelCheckpoint(monitor='val_loss', dirpath=f'../results/{experiment_key}/checkpoints', filename='{epoch:02d}-{val_loss:.2f}', save_top_k=chckpt_save_top_k, mode='min')
+    early_stop_callback = EarlyStopping(monitor='val_g_recons_loss', min_delta=es_min_delta, patience=es_patience, mode='min')
+    checkpoint_callback = ModelCheckpoint(monitor='val_g_recons_loss', dirpath=f'../results/{experiment_key}/checkpoints', filename='{epoch:02d}-{val_loss:.2f}', save_top_k=chckpt_save_top_k, mode='min')
     return [early_stop_callback, checkpoint_callback]
 
 
 def training():
-    model_config = get_parser_from_json('models/double_latent_ae_config.json')
+    model_config = get_parser_from_json('models/dual_latent_ae_config.json')
     model = DualLatentAE(args_dict=vars(model_config))
 
     train_dataset, test_dataset = get_dset()
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True, num_workers=os.cpu_count())
     test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True, pin_memory=True, num_workers=os.cpu_count())
 
-    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=['VQVAE', 'RAVDESS', 'LeakyReLU', 'NEAREST'])
+    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=['VQVAE', 'RAVDESS', 'LeakyReLU', 'NEAREST', 'WAVE DISCRIMINATOR'])
 
     trainer = Trainer(callbacks=set_up_callbacks(comet_logger.experiment.get_key()),  # https://lightning.ai/docs/pytorch/stable/common/trainer.html#
                       logger=comet_logger,

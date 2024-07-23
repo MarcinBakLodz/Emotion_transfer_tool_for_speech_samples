@@ -12,7 +12,7 @@ class VectorQuantizer(torch.nn.Module):
     - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
     """
 
-    def __init__(self, n_e, e_dim, beta=0.25, check_dims=False):
+    def __init__(self, n_e, e_dim, beta=0.25):
         super().__init__()
         self.device = 'cpu'
 
@@ -22,7 +22,6 @@ class VectorQuantizer(torch.nn.Module):
         # but typically they use 1x1 convolution to fix dimensions
 
         self.beta = beta
-        self.check_dims = check_dims
 
         self.embedding = torch.nn.Embedding(self.n_e, self.e_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)  # codebook initialization
@@ -199,7 +198,7 @@ class Decoder(torch.nn.Module):
 
 
 class DualLatentEncoder(torch.nn.Module):
-    def __init__(self, in_dim, h_dim, cont_latent_dim, vq_latent_dim, n_e, beta, verbose):
+    def __init__(self, in_dim, h_dim, cont_latent_dim, vq_latent_dim, n_e, beta):
         super().__init__()
 
         self.conv_stack_1 = torch.nn.Sequential(
@@ -217,7 +216,7 @@ class DualLatentEncoder(torch.nn.Module):
 
         self.vector_quantization = torch.nn.Sequential(
             torch.nn.Conv1d(h_dim, vq_latent_dim, kernel_size=3, stride=2, padding=1),
-            VectorQuantizer(n_e, vq_latent_dim, beta, check_dims=verbose)
+            VectorQuantizer(n_e, vq_latent_dim, beta)
         )
 
     def forward(self, x):
@@ -236,7 +235,6 @@ class DualLatentDecoder(Decoder):
 
 
 # TODO: INTEGRATE AND TEST DISCRIMINATORS
-
 # source: https://github.com/kaiidams/soundstream-pytorch/blob/main/soundstream.py
 class WaveDiscriminator(torch.nn.Module):
     r"""MelGAN discriminator from https://arxiv.org/pdf/1910.06711.pdf
@@ -253,13 +251,13 @@ class WaveDiscriminator(torch.nn.Module):
         self.activation = torch.nn.LeakyReLU(0.2, inplace=True)
 
         self.layers = torch.nn.ModuleList([
-            torch.nn.utils.weight_norm(torch.nn.Conv1d(1, n_channels, kernel_size=15, padding=7)),
-            torch.nn.utils.weight_norm(torch.nn.Conv1d(n_channels, 4 * n_channels, kernel_size=41, stride=4, padding=20, groups=4)),
-            torch.nn.utils.weight_norm(torch.nn.Conv1d(4 * n_channels, 16 * n_channels, kernel_size=41, stride=4, padding=20, groups=16)),
-            torch.nn.utils.weight_norm(torch.nn.Conv1d(16 * n_channels, 64 * n_channels, kernel_size=41, stride=4, padding=20, groups=64)),
-            torch.nn.utils.weight_norm(torch.nn.Conv1d(64 * n_channels, 256 * n_channels, kernel_size=41, stride=4, padding=20, groups=256)),
-            torch.nn.utils.weight_norm(torch.nn.Conv1d(256 * n_channels, 256 * n_channels, kernel_size=5, padding=2)),
-            torch.nn.utils.weight_norm(torch.nn.Conv1d(256 * n_channels, 1, kernel_size=3, padding=1)),
+            torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(1, n_channels, kernel_size=15, padding=7)),
+            torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(n_channels, 4 * n_channels, kernel_size=41, stride=4, padding=20, groups=4)),
+            torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(4 * n_channels, 8 * n_channels, kernel_size=41, stride=4, padding=20, groups=8)),
+            torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(8 * n_channels, 16 * n_channels, kernel_size=41, stride=4, padding=20, groups=16)),
+            torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(16 * n_channels, 32 * n_channels, kernel_size=41, stride=4, padding=20, groups=32)),
+            torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(32 * n_channels, 32 * n_channels, kernel_size=5, padding=2)),
+            torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(32 * n_channels, 1, kernel_size=3, padding=1)),
         ])
 
     def forward(self, x):
@@ -345,12 +343,13 @@ if __name__ == '__main__':
     from torchinfo import summary
 
     sample = torch.randn(size=(1, 1, 32768))
-    enc = DualLatentEncoder(in_dim=1, h_dim=256, cont_latent_dim=16, n_e=512, vq_latent_dim=16, beta=0.25, verbose=False)
-    # enc = Encoder(in_dim=1, h_dim=256, latent_dim=10)
+
+    # enc = DualLatentEncoder(in_dim=1, h_dim=256, cont_latent_dim=16, n_e=512, vq_latent_dim=16, beta=0.25, verbose=False)
+    enc = Encoder(in_dim=1, h_dim=256, latent_dim=1)
     summ = summary(enc, input_data=sample)
 
-    # disc = WaveDiscriminator(n_channels=4)
-    # summ = summary(disc, input_data=sample.to('cuda'), device='cuda')
+    # disc = WaveDiscriminator(resolution=4, n_channels=4)
+    # summ = summary(disc, input_data=sample)
     # out = disc(sample.to('cuda'))
     # print(out[-1].size())
 
