@@ -50,7 +50,7 @@ class AE(LightningModule):
             if isinstance(transform, torch.nn.Module):
                 transform.to(self.device)
 
-        optimizer_g = torch.optim.Adam(self.parameters(), lr=self.g_learning_rate, weight_decay=self.weight_decay)
+        optimizer_g = torch.optim.Adam(chain(self.encoder.parameters(), self.decoder.parameters()), lr=self.g_learning_rate, weight_decay=self.weight_decay)
         optimizer_d = torch.optim.Adam(self.wave_discriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
 
         return [optimizer_g, optimizer_d], []
@@ -183,8 +183,15 @@ class VQVAE(AE):
         self.vector_quantization = VectorQuantizer(n_e=self.n_e, e_dim=self.latent_dim, beta=self.beta)
 
     def configure_optimizers(self):
+        for transform in self.mel_transform.transforms:
+            if isinstance(transform, torch.nn.Module):
+                transform.to(self.device)
+
         self.vector_quantization.set_device(self.device)
-        return super().configure_optimizers()
+        optimizer_g = torch.optim.Adam(chain(self.encoder.parameters(), self.vector_quantization.parameters(), self.decoder.parameters()), lr=self.g_learning_rate, weight_decay=self.weight_decay)
+        optimizer_d = torch.optim.Adam(self.wave_discriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
+
+        return [optimizer_g, optimizer_d], []
 
     def forward(self, x):
         z_e = self.encoder(x)

@@ -1,7 +1,8 @@
 {
+  "name": "Dual Latent",
   "in_dim": 1,
   "h_dim": 256,
-  "disc_h_dim": 16,
+  "disc_h_dim": 4,
   "cont_latent_dim": 1,
   "vq_latent_dim": 1,
   "latent_dim": 2,
