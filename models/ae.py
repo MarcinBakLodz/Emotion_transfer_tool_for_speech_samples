@@ -476,8 +476,8 @@ class DualLatentWithSwappingAE(VQVAE):
         self.log('val_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
 
         # log image metrics
-        self.log('val_reconstruction_ssim', self.ssim(self.mel_transform(x_hat1), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
-        self.log('val_swapp_ssim', self.ssim(self.mel_transform(x_hat2), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
+        self.log('val_reconstruction_ssim', self.ssim(self.mel_transform(x_hat1), self.mel_transform(batch[:,0])), sync_dist=True, batch_size=self.batch_size)
+        self.log('val_swapp_ssim', self.ssim(self.mel_transform(x_hat2), self.mel_transform(batch[:,1])), sync_dist=True, batch_size=self.batch_size)
 
         # log audio metrics every 10th batch, since they're calculated on CPU and it takes some time
         if batch_idx % 10 == 0:
