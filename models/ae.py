@@ -447,6 +447,7 @@ class DualLatentWithSwappingAE(VQVAE):
                 except TypeError:
                     continue
 
+
         # log exemplary data, let's save 5 examples per epoch
         if batch_idx < 5:
             self.logger.experiment.log_audio(audio_data=batch[0][0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_content.wav')
