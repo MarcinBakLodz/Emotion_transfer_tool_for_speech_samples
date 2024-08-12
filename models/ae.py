@@ -10,7 +10,7 @@ from torchvision.transforms import Compose
 from torchmetrics.audio import PerceptualEvaluationSpeechQuality, ShortTimeObjectiveIntelligibility
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
-from models.layers import Decoder, Encoder, VectorQuantizer, DualLatentEncoder, DualLatentDecoder
+from models.layers import Decoder, Encoder, VectorQuantizer, DualLatentEncoder, DualLatentDecoder, CooccurencePatchDiscriminator
 from models.model_utils import skip_if_sanity_checking
 
 
@@ -293,3 +293,216 @@ class DualLatentAE(VQVAE):
         x, z_q, embedding_loss, perplexity = self.encoder(x)
         x_hat = self.decoder(x, z_q)
         return x_hat, embedding_loss, perplexity
+    
+
+class DualLatentWithSwappingAE(VQVAE):
+    def __init__(self, args_dict):
+        super(DualLatentWithSwappingAE, self).__init__(args_dict)
+        del self.vector_quantization
+
+        self.encoder = DualLatentEncoder(in_dim=self.in_dim,
+                                         h_dim=self.h_dim,
+                                         cont_latent_dim=self.cont_latent_dim,
+                                         vq_latent_dim=self.vq_latent_dim,
+                                         n_e=self.n_e,
+                                         beta=self.beta)
+
+        self.decoder = DualLatentDecoder(in_dim=self.latent_dim, h_dim=self.h_dim)
+        
+        self.coocDiscriminator = CooccurencePatchDiscriminator(in_dim=self.in_dim)
+        
+################### TO JEST TEN W KTÓRYM CHCE PRACOWAC
+    def configure_optimizers(self):
+        # cant call .to(device) on Compose, has to be called on individual modules inside (theoretically it should move automatically, but still it creates window on CPU)
+        # we're doing it in configure_optimizers() since self.device is already known
+        self.encoder.vector_quantization[1].set_device(self.device)
+        for transform in self.mel_transform.transforms:
+            if isinstance(transform, torch.nn.Module):
+                transform.to(self.device)
+
+        optimizer_g = torch.optim.Adam(chain(self.encoder.parameters(), self.decoder.parameters()), lr=self.g_learning_rate, weight_decay=self.weight_decay)
+        optimizer_d = torch.optim.Adam(self.wave_discriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
+        optimizer_coocd = torch.optim.Adam(self.coocDiscriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
+        return [optimizer_g, optimizer_d, optimizer_coocd], []
+
+
+    def forward(self, x12):
+        x1 = x12[:, 0]
+        x2 = x12[:, 1]
+        encoded_x1, z_q1, embedding_loss1, perplexity1 = self.encoder(x1)
+        encoded_x2, z_q2, embedding_loss2, perplexity2 = self.encoder(x2)
+        
+        x_hat1 = self.decoder(encoded_x1, z_q1)
+        x_hat2 = self.decoder(encoded_x2, z_q1)
+        
+        return x_hat1, x_hat2, embedding_loss1, embedding_loss2, perplexity1, perplexity2
+
+    def training_step(self, batch, batch_idx):
+        if batch.shape[0] % 2 != 0:
+            batch = batch[:-1]
+        batch = batch.view(batch.shape[0] // 2, 2, 1, batch.shape[-1])
+        optimizer_g, optimizer_d, optimizer_coocd = self.optimizers()
+        x_hat1, x_hat2, embedding_loss1, embedding_loss2, perplexity1, perplexity2 = self(batch)
+        embedding_loss1 *= 100
+        embedding_loss2 *= 100
+
+        # train generator
+        self.toggle_optimizer(optimizer_g)
+        recon_loss = self.loss_fn(x_hat1, batch[:, 0]) * 100
+        
+        g_wave_reconstruction_fake = self.wave_discriminator(x_hat1)
+        g_wave_swapping_fake = self.wave_discriminator(x_hat2)
+        g__wave_reconstruction_loss = self.disc_loss_fn(g_wave_reconstruction_fake, torch.ones_like(g_wave_reconstruction_fake))
+        g__wave_swapping_loss = self.disc_loss_fn(g_wave_swapping_fake, torch.ones_like(g_wave_swapping_fake))
+        g_wave_loss = (g__wave_reconstruction_loss + g__wave_swapping_loss) / 2
+        g_loss = recon_loss + (embedding_loss1/2) + (embedding_loss2/2) + g_wave_loss
+
+        
+        self.manual_backward(g_loss)
+        optimizer_g.step()
+        optimizer_g.zero_grad()
+        self.untoggle_optimizer(optimizer_g)
+
+
+        # train discriminator
+        x_hat1, x_hat2, *_ = self(batch)
+        self.toggle_optimizer(optimizer_d)
+
+        d_output_reconstruction_path_real = self.wave_discriminator(batch[:, 0])
+        d_output_reconstruction_path_fake = self.wave_discriminator(x_hat1)
+
+        d_output_swapp_path_real = self.wave_discriminator(batch[:, 1])
+        d_output_swapp_path_fake = self.wave_discriminator(x_hat2)
+
+        d_reconsctruction_loss_real = self.disc_loss_fn(d_output_reconstruction_path_real, torch.ones_like(d_output_reconstruction_path_real))
+        d_reconsctruction_loss_fake = self.disc_loss_fn(d_output_reconstruction_path_fake, torch.zeros_like(d_output_reconstruction_path_fake))
+
+        d_swapp_loss_real = self.disc_loss_fn(d_output_swapp_path_real, torch.ones_like(d_output_swapp_path_real))
+        d_swapp_loss_fake = self.disc_loss_fn(d_output_swapp_path_fake, torch.zeros_like(d_output_swapp_path_fake))
+
+        d_reconstruction_loss = (d_reconsctruction_loss_real + d_reconsctruction_loss_fake) / 2
+        d_swap_loss = (d_swapp_loss_real + d_swapp_loss_fake) / 2
+        
+        d_result_loss = (d_reconstruction_loss + d_swap_loss) / 2
+        
+        self.manual_backward(d_result_loss)
+        optimizer_d.step()
+        optimizer_d.zero_grad()
+        self.untoggle_optimizer(optimizer_d)
+
+        self.log_training_step_metrics(recon_loss, g_wave_loss, d_result_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, x_hat1, x_hat2, batch, batch_idx)
+
+
+    def validation_step(self, batch, batch_idx):
+        if batch.shape[0] % 2 != 0:
+            batch = batch[:-1]
+        batch = batch.view(batch.shape[0] // 2, 2, 1, batch.shape[-1])
+        x_hat1, x_hat2, embedding_loss1, embedding_loss2, perplexity1, perplexity2 = self(batch)
+        recon_loss = self.loss_fn(x_hat1, batch[:,0])
+
+        g_output_recenstruction_fake = self.wave_discriminator(x_hat1)
+        g_wave_reconstruction_loss = self.disc_loss_fn(g_output_recenstruction_fake, torch.ones_like(g_output_recenstruction_fake))
+
+        g_output_swapp_fake = self.wave_discriminator(x_hat2)
+        g_wave_swapp_loss = self.disc_loss_fn(g_output_swapp_fake, torch.ones_like(g_output_swapp_fake))
+        
+        g_wave_loss = (g_wave_reconstruction_loss + g_wave_swapp_loss) / 2
+
+        d_output_reconstruction_real = self.wave_discriminator(batch[:,0])
+        d_output_reconstruction_fake = self.wave_discriminator(x_hat1)
+        
+        d_output_swapp_real = self.wave_discriminator(batch[:,1])
+        d_output_swapp_fake = self.wave_discriminator(x_hat2)
+
+        d_wave_reconstruction_loss_real = self.disc_loss_fn(d_output_reconstruction_real, torch.ones_like(d_output_reconstruction_real))
+        d_wave_reconstruction_loss_fake = self.disc_loss_fn(d_output_reconstruction_fake, torch.zeros_like(d_output_reconstruction_fake))
+        
+        d_wave_swapp_loss_real = self.disc_loss_fn(d_output_swapp_real, torch.ones_like(d_output_swapp_real))
+        d_wave_swapp_loss_fake = self.disc_loss_fn(d_output_swapp_fake, torch.zeros_like(d_output_swapp_fake))
+
+        d_wave_reconstruction_loss = (d_wave_reconstruction_loss_real + d_wave_reconstruction_loss_fake) / 2
+        d_wave_swapp_loss = (d_wave_swapp_loss_real + d_wave_swapp_loss_fake) / 2
+        
+        d_wave_loss = (d_wave_reconstruction_loss + d_wave_swapp_loss) / 2
+
+        self.log_validation_step_metrics(recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2,  x_hat1, x_hat2, batch, batch_idx)
+
+    @torch.no_grad()
+    def log_training_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, x_hat1, x_hat2, batch, batch_idx):
+        # log loss
+        self.log('train_g_recons_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
+
+        # log image metrics
+        self.log('train_reconstruction_ssim', self.ssim(self.mel_transform(x_hat1), self.mel_transform(batch[:,0])), sync_dist=True, batch_size=self.batch_size)
+        self.log('train_swap_ssim', self.ssim(self.mel_transform(x_hat2), self.mel_transform(batch[:,1])), sync_dist=True, batch_size=self.batch_size)
+
+        # log audio metrics every 10th batch, since they're calculated on CPU and it takes some time
+        if batch_idx % 10 == 0:
+            for metric_name, metric_func in [('train_pesq', self.pesq), ('train_stoi', self.stoi)]:
+                try:
+                    self.log(metric_name+"reconstruction", metric_func(x_hat1, batch[:,0]), sync_dist=True, batch_size=self.batch_size)
+                    self.log(metric_name+"swapp", metric_func(x_hat2, batch[:,1]), sync_dist=True, batch_size=self.batch_size)
+                except TypeError:
+                    continue
+
+        # log exemplary data, let's save 5 examples per epoch
+        if batch_idx < 5:
+            self.logger.experiment.log_audio(audio_data=batch[0][0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_content.wav')
+            self.logger.experiment.log_audio(audio_data=batch[0][1][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_style.wav')
+
+            self.logger.experiment.log_audio(audio_data=x_hat1[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_recons.wav')
+            self.logger.experiment.log_audio(audio_data=x_hat2[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_swapped.wav')
+            
+            self.logger.experiment.log_image(image_data=self.mel_transform(batch[0][0]).to('cpu').numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_target_content')
+            self.logger.experiment.log_image(image_data=self.mel_transform(batch[0][1]).to('cpu').numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_target_style')
+
+            self.logger.experiment.log_image(image_data=self.mel_transform(x_hat1[0]).to('cpu').numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_reconstructed')
+            self.logger.experiment.log_image(image_data=self.mel_transform(x_hat2[0]).to('cpu').numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_swapped')
+
+        # Log additional metrics specific to VQVAE
+        self.log('train_reconstruction_embedding_loss', embedding_loss1, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_swapp_embedding_loss', embedding_loss2, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_reconstruction_perplexity', perplexity1, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_swapp_perplexity', perplexity2, sync_dist=True, batch_size=self.batch_size)
+
+    @torch.no_grad()
+    @skip_if_sanity_checking
+    def log_validation_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, x_hat1, x_hat2, batch, batch_idx):
+        self.log('val_g_recons_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
+
+        # log image metrics
+        self.log('val_reconstruction_ssim', self.ssim(self.mel_transform(x_hat1), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
+        self.log('val_swapp_ssim', self.ssim(self.mel_transform(x_hat2), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
+
+        # log audio metrics every 10th batch, since they're calculated on CPU and it takes some time
+        if batch_idx % 10 == 0:
+            for metric_name, metric_func in [('val_pesq', self.pesq), ('val_stoi', self.stoi)]:
+                try:
+                    self.log(metric_name+"reconstruction", metric_func(x_hat1, batch[:,0]), sync_dist=True, batch_size=self.batch_size)
+                    self.log(metric_name+"swapp", metric_func(x_hat2, batch[:1]), sync_dist=True, batch_size=self.batch_size)
+                except TypeError:
+                    continue
+
+        # log exemplary data, let's save 5 examples per epoch
+        if batch_idx < 5:
+            self.logger.experiment.log_audio(audio_data=batch[0][0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_content.wav')
+            self.logger.experiment.log_audio(audio_data=batch[0][1][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_style.wav')
+            
+            self.logger.experiment.log_audio(audio_data=x_hat1[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_reconstruction.wav')
+            self.logger.experiment.log_audio(audio_data=x_hat2[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_swapp.wav')
+            
+            self.logger.experiment.log_image(image_data=self.mel_transform(batch[0][0]).to('cpu').numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_content')
+            self.logger.experiment.log_image(image_data=self.mel_transform(batch[0][1]).to('cpu').numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_style')
+            self.logger.experiment.log_image(image_data=self.mel_transform(x_hat1[0]).to('cpu').numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_reconstruction')
+            self.logger.experiment.log_image(image_data=self.mel_transform(x_hat2[0]).to('cpu').numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_swapp')
+
+
+        self.log('train_reconstruction_embedding_loss', embedding_loss1, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_swapp_embedding_loss', embedding_loss2, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_reconstruction_perplexity', perplexity1, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_swapp_perplexity', perplexity2, sync_dist=True, batch_size=self.batch_size)
+

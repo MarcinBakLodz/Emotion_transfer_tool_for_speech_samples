@@ -338,6 +338,18 @@ class STFTDiscriminator(torch.nn.Module):
         x = self.layers(x)
         return x
 
+class CooccurencePatchDiscriminator(torch.nn.Module):
+    def __init__(self, in_dim= 32768, h_dim = 0):
+        self.in_dim=in_dim
+        self.h_dim=h_dim
+        super(CooccurencePatchDiscriminator, self).__init__()
+        self.f1 = torch.nn.Linear(in_dim,15)
+        self.f2 = torch.nn.Linear(15, 1)
+    
+    def forward(self, input):
+        y = self.f1(input)
+        return self.f2(y)
+
 
 if __name__ == '__main__':
     from torchinfo import summary

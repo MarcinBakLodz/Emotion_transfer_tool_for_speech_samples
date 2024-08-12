@@ -14,7 +14,7 @@ from utils import get_parser_from_json
 
 def get_dset(train_share=0.8):
     # dset = VCTK(root_dir='../data')
-    dset = RAVDESS(root_dir=r'C:\Users\Marcin\Desktop\Studia\Transfer_Emocji\data\RAVDESS\Wave')
+    dset = RAVDESS(root_dir=r'C:\Users\Marcin\Desktop\Studia\Transfer_Emocji\data\RAVDESS\Original')
     train_size = int(train_share * len(dset))
     test_size = len(dset) - train_size
     return torch.utils.data.random_split(dataset=dset, lengths=[train_size, test_size], generator=torch.Generator().manual_seed(42))  # fix the generator for reproducible results
@@ -42,7 +42,8 @@ def set_up_comet_logger(model, model_config, test_sample, tags):
     comet_logger.experiment.log_parameter(name="n_params", value=total_params)
 
     # log summary
-    summ = summary(model=model, input_data=test_sample.to(next(model.parameters()).device), device=next(model.parameters()).device, verbose=0)
+    input = torch.stack((test_sample.to(next(model.parameters()).device), test_sample.to(next(model.parameters()).device)), dim = 1)
+    summ = summary(model=model, input_data=input, device=next(model.parameters()).device, verbose=0)
     comet_logger.experiment.set_model_graph(graph=f"{model.__repr__()}\n\n{summ}")
 
     return comet_logger
@@ -59,14 +60,14 @@ def training():
     model = DualLatentWithSwappingAE(args_dict=vars(model_config))
 
     train_dataset, test_dataset = get_dset()
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True, num_workers=os.cpu_count())
-    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True, pin_memory=True, num_workers=os.cpu_count())
+    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True, num_workers=os.cpu_count(), persistent_workers=True)
+    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True, pin_memory=True, num_workers=os.cpu_count(), persistent_workers=True)
 
     comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=[model_config.name, 'RAVDESS', 'LeakyReLU', 'NEAREST', 'WAVE DISCRIMINATOR'])
 
     trainer = Trainer(callbacks=set_up_callbacks(comet_logger.experiment.get_key()),  # https://lightning.ai/docs/pytorch/stable/common/trainer.html#
                       logger=comet_logger,
-                      log_every_n_steps=10,
+                      log_every_n_steps=1,
                       accelerator='auto',
                       devices='auto',
                       precision='32-true',
