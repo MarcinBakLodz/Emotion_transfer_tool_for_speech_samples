@@ -339,6 +339,47 @@ class STFTDiscriminator(torch.nn.Module):
         return x
 
 
+class Classifier(torch.nn.Module):
+    def __init__(self, cont_latent_dim, num_classes):
+        super(Classifier, self).__init__()
+        self.layers = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool1d(1), # zwiększyć
+            torch.nn.Flatten(),
+            torch.nn.Linear(cont_latent_dim, num_classes), # dodać jeszcze jedną i jakąś aktywację
+            torch.nn.Softmax(dim=-1)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class GradientReversalF(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.save_for_backward(x, alpha)
+        return x
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = None
+        _, alpha = ctx.saved_tensors
+        if ctx.needs_input_grad[0]:
+            grad_input = - alpha*grad_output
+        return grad_input, None
+revgrad = GradientReversalF.apply
+
+
+class GradientReversal(torch.nn.Module):
+    r"""Gradient reversal layer from https://github.com/tadeephuy/GradientReversal
+    """
+    def __init__(self, alpha):
+        super().__init__()
+        self.alpha = torch.tensor(alpha, requires_grad=False)
+
+    def forward(self, x):
+        return revgrad(x, self.alpha)
+
+
 if __name__ == '__main__':
     from torchinfo import summary
 
@@ -356,3 +397,5 @@ if __name__ == '__main__':
     # latent = torch.randn(size=(1, 2048))
     # dec = Decoder(in_dim=1, h_dim=32)
     # summ2 = summary(dec, input_data=latent.to('cuda'), device='cuda')
+
+

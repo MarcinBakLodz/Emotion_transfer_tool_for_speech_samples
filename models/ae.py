@@ -10,7 +10,7 @@ from torchvision.transforms import Compose
 from torchmetrics.audio import PerceptualEvaluationSpeechQuality, ShortTimeObjectiveIntelligibility
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
-from models.layers import Decoder, Encoder, VectorQuantizer, DualLatentEncoder, DualLatentDecoder
+from models.layers import Decoder, Encoder, VectorQuantizer, DualLatentEncoder, DualLatentDecoder, Classifier, GradientReversal
 from models.model_utils import skip_if_sanity_checking
 
 
@@ -188,6 +188,7 @@ class VQVAE(AE):
                 transform.to(self.device)
 
         self.vector_quantization.set_device(self.device)
+
         optimizer_g = torch.optim.Adam(chain(self.encoder.parameters(), self.vector_quantization.parameters(), self.decoder.parameters()), lr=self.g_learning_rate, weight_decay=self.weight_decay)
         optimizer_d = torch.optim.Adam(self.wave_discriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
 
@@ -285,11 +286,181 @@ class DualLatentAE(VQVAE):
 
         self.decoder = DualLatentDecoder(in_dim=self.latent_dim, h_dim=self.h_dim)
 
+        self.classifier = Classifier(self.cont_latent_dim, self.num_classes)
+        self.grl_classifier = Classifier(self.vq_latent_dim, self.num_classes)
+
+        self.grl = GradientReversal(alpha=1.0)
+
     def configure_optimizers(self):
         self.encoder.vector_quantization[1].set_device(self.device)
-        return AE.configure_optimizers(self)
+
+        for transform in self.mel_transform.transforms:
+            if isinstance(transform, torch.nn.Module):
+                transform.to(self.device)
+
+        # optimizer_g = torch.optim.Adam(chain(self.encoder.parameters(), self.decoder.parameters(), self.classifier.parameters(), self.grl_classifier.parameters()), lr=self.g_learning_rate, weight_decay=self.weight_decay)
+        
+        # test of this functionality
+        optimizer_g = torch.optim.Adam(
+            [
+                {'params': self.encoder.parameters()},
+                {'params': self.decoder.parameters()},
+                {'params': self.classifier.parameters()},
+                {'params': self.grl_classifier.parameters()}
+            ],
+            lr=self.g_learning_rate, 
+            weight_decay=self.weight_decay
+        )        
+        
+        optimizer_d = torch.optim.Adam(self.wave_discriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
+
+        return [optimizer_g, optimizer_d], []
 
     def forward(self, x):
         x, z_q, embedding_loss, perplexity = self.encoder(x)
         x_hat = self.decoder(x, z_q)
-        return x_hat, embedding_loss, perplexity
+        
+        x_flat = torch.mean(x, dim=-1, keepdim=True)
+        class_logits = self.classifier(x_flat)
+
+        z_q_flat = torch.mean(z_q, dim=-1, keepdim=True)
+        z_q_grl = self.grl(z_q_flat)
+        grl_class_logits = self.grl_classifier(z_q_grl)
+
+        return x_hat, embedding_loss, perplexity, class_logits, grl_class_logits
+
+    def training_step(self, batch, batch_idx):
+        optimizer_g, optimizer_d = self.optimizers()
+        data, target = batch
+
+        x_hat, embedding_loss, perplexity, class_logits, grl_class_logits = self(data)
+        embedding_loss *= 100
+
+        # train generator
+        self.toggle_optimizer(optimizer_g)
+        recon_loss = self.loss_fn(x_hat, data) * 100
+
+        # Dodajemy stratę klasyfikacji
+        classification_loss = torch.nn.functional.cross_entropy(class_logits, target)
+        grl_classification_loss = torch.nn.functional.cross_entropy(grl_class_logits, target)
+
+        acc = (class_logits.argmax(dim=1) == target).float().mean()
+        grl_acc = (grl_class_logits.argmax(dim=1) == target).float().mean()
+
+        g_output_fake = self.wave_discriminator(x_hat)
+        g_wave_loss = self.disc_loss_fn(g_output_fake, torch.ones_like(g_output_fake))
+        g_loss = recon_loss + embedding_loss + g_wave_loss + classification_loss + grl_classification_loss
+
+        self.manual_backward(g_loss)
+        optimizer_g.step()
+        optimizer_g.zero_grad()
+        self.untoggle_optimizer(optimizer_g)
+
+        # train discriminator
+        x_hat, *_ = self(data)
+        self.toggle_optimizer(optimizer_d)
+
+        d_output_real = self.wave_discriminator(data)
+        d_output_fake = self.wave_discriminator(x_hat)
+
+        d_wave_loss_real = self.disc_loss_fn(d_output_real, torch.ones_like(d_output_real))
+        d_wave_loss_fake = self.disc_loss_fn(d_output_fake, torch.zeros_like(d_output_fake))
+
+        d_wave_loss = (d_wave_loss_real + d_wave_loss_fake) / 2
+
+        self.manual_backward(d_wave_loss)
+        optimizer_d.step()
+        optimizer_d.zero_grad()
+        self.untoggle_optimizer(optimizer_d)
+
+        self.log_training_step_metrics(recon_loss, g_wave_loss, g_loss, d_wave_loss, embedding_loss, perplexity, x_hat, data, batch_idx, classification_loss, acc, grl_classification_loss, grl_acc)
+
+    def validation_step(self, batch, batch_idx):
+        data, target = batch
+
+        x_hat, embedding_loss, perplexity, class_logits, grl_class_logits = self(data)
+        recon_loss = self.loss_fn(x_hat, data)
+
+        classification_loss = torch.nn.functional.cross_entropy(class_logits, target)
+        grl_classification_loss = torch.nn.functional.cross_entropy(grl_class_logits, target)
+
+        acc = (class_logits.argmax(dim=1) == target).float().mean()
+        grl_acc = (grl_class_logits.argmax(dim=1) == target).float().mean()
+
+        g_output_fake = self.wave_discriminator(x_hat)
+        g_wave_loss = self.disc_loss_fn(g_output_fake, torch.ones_like(g_output_fake))
+        g_loss = recon_loss + embedding_loss + g_wave_loss + classification_loss + grl_classification_loss
+
+        d_output_real = self.wave_discriminator(data)
+        d_output_fake = self.wave_discriminator(x_hat)
+
+        d_wave_loss_real = self.disc_loss_fn(d_output_real, torch.ones_like(d_output_real))
+        d_wave_loss_fake = self.disc_loss_fn(d_output_fake, torch.zeros_like(d_output_fake))
+
+        d_wave_loss = (d_wave_loss_real + d_wave_loss_fake) / 2
+
+        self.log_validation_step_metrics(recon_loss, g_wave_loss, g_loss, d_wave_loss, embedding_loss, perplexity, x_hat, data, batch_idx, classification_loss, acc, grl_classification_loss, grl_acc)
+
+    @torch.no_grad()
+    def log_training_step_metrics(self, recon_loss, g_wave_loss, g_loss, d_wave_loss, embedding_loss, perplexity, x_hat, batch, batch_idx, classification_loss, acc, grl_classification_loss, grl_acc):
+        # Log additional metrics specific to VQVAE
+        self.log('train_recon_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('g_loss', g_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_embedding_loss', embedding_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_perplexity', perplexity, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_classification_loss', classification_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_accuracy', acc, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_grl_classification_loss', grl_classification_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_grl_accuracy', grl_acc, sync_dist=True, batch_size=self.batch_size)
+
+        # Log image metrics
+        self.log('train_ssim', self.ssim(self.mel_transform(x_hat), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
+
+        # Log audio metrics every 10th batch
+        if batch_idx % 10 == 0:
+            for metric_name, metric_func in [('train_pesq', self.pesq), ('train_stoi', self.stoi)]:
+                try:
+                    self.log(metric_name, metric_func(x_hat, batch), sync_dist=True, batch_size=self.batch_size)
+                except TypeError:
+                    continue
+
+        if batch_idx < 5:
+            self.logger.experiment.log_audio(audio_data=batch[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}.wav')
+            self.logger.experiment.log_audio(audio_data=x_hat[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_recons.wav')
+            self.logger.experiment.log_image(image_data=self.mel_transform(batch[0]).to('cpu').numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_target')
+            self.logger.experiment.log_image(image_data=self.mel_transform(x_hat[0]).to('cpu').numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_pred')
+
+    @torch.no_grad()
+    @skip_if_sanity_checking
+    def log_validation_step_metrics(self, recon_loss, g_wave_loss, g_loss, d_wave_loss, embedding_loss, perplexity, x_hat, batch, batch_idx, classification_loss, acc, grl_classification_loss, grl_acc):
+        # Log additional metrics specific to VQVAE
+        self.log('val_recon_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_g_loss', g_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_embedding_loss', embedding_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_perplexity', perplexity, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_classification_loss', classification_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_accuracy', acc, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_grl_classification_loss', grl_classification_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_grl_accuracy', grl_acc, sync_dist=True, batch_size=self.batch_size)
+
+        # Log image metrics
+        self.log('val_ssim', self.ssim(self.mel_transform(x_hat), self.mel_transform(batch)), sync_dist=True, batch_size=self.batch_size)
+
+        # Log audio metrics every 10th batch
+        if batch_idx % 10 == 0:
+            for metric_name, metric_func in [('val_pesq', self.pesq), ('val_stoi', self.stoi)]:
+                try:
+                    self.log(metric_name, metric_func(x_hat, batch), sync_dist=True, batch_size=self.batch_size)
+                except TypeError:
+                    continue
+
+        # log exemplary data, let's save 5 examples per epoch
+        if batch_idx < 5:
+            self.logger.experiment.log_audio(audio_data=batch[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}.wav')
+            self.logger.experiment.log_audio(audio_data=x_hat[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_recons.wav')
+            self.logger.experiment.log_image(image_data=self.mel_transform(batch[0]).to('cpu').numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_target')
+            self.logger.experiment.log_image(image_data=self.mel_transform(x_hat[0]).to('cpu').numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_pred')

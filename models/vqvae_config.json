@@ -1,5 +1,4 @@
 {
-  "name": "VQVAE",
   "in_dim": 1,
   "h_dim": 256,
   "latent_dim": 10,

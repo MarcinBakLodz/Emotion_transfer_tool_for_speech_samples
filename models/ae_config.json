@@ -1,5 +1,4 @@
 {
-  "name": "AE",
   "in_dim": 1,
   "h_dim": 256,
   "disc_h_dim": 4,

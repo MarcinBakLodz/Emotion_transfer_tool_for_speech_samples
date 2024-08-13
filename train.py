@@ -13,15 +13,19 @@ from utils import get_parser_from_json
 
 
 def get_dset(train_share=0.8):
-    # dset = VCTK(root_dir='../data')
-    dset = RAVDESS(root_dir='../data/RAVDESS')
+    dset = RAVDESS(root_dir='./data/RAVDESS')
     train_size = int(train_share * len(dset))
     test_size = len(dset) - train_size
     return torch.utils.data.random_split(dataset=dset, lengths=[train_size, test_size], generator=torch.Generator().manual_seed(42))  # fix the generator for reproducible results
 
+def get_comet_config(file_path):
+    with open(file_path, 'r') as file:
+        file_content = file.read().splitlines()
+    return file_content[0], file_content[1]  # API key, Project name
 
 def set_up_comet_logger(model, model_config, test_sample, tags):
-    comet_logger = CometLogger()  # https://www.comet.com/docs/v2/api-and-sdk/python-sdk/reference/Experiment/
+    api_key, project_name = get_comet_config("./comet_config.txt")
+    comet_logger = CometLogger(api_key=api_key, project_name=project_name)  # https://www.comet.com/docs/v2/api-and-sdk/python-sdk/reference/Experiment/
     comet_logger.log_hyperparams(vars(model_config))
 
     for tag in tags:
@@ -42,15 +46,15 @@ def set_up_comet_logger(model, model_config, test_sample, tags):
     comet_logger.experiment.log_parameter(name="n_params", value=total_params)
 
     # log summary
-    summ = summary(model=model, input_data=test_sample.to(next(model.parameters()).device), device=next(model.parameters()).device, verbose=0)
+    summ = summary(model=model, input_data=test_sample[0].to(next(model.parameters()).device), device=next(model.parameters()).device, verbose=0)
     comet_logger.experiment.set_model_graph(graph=f"{model.__repr__()}\n\n{summ}")
 
     return comet_logger
 
 
 def set_up_callbacks(experiment_key, es_min_delta=1e-9, es_patience=100, chckpt_save_top_k=5):
-    early_stop_callback = EarlyStopping(monitor='val_g_recons_loss', min_delta=es_min_delta, patience=es_patience, mode='min')
-    checkpoint_callback = ModelCheckpoint(monitor='val_g_recons_loss', dirpath=f'../results/{experiment_key}/checkpoints', filename='{epoch:02d}-{val_loss:.2f}', save_top_k=chckpt_save_top_k, mode='min')
+    early_stop_callback = EarlyStopping(monitor='val_recon_loss', min_delta=es_min_delta, patience=es_patience, mode='min')
+    checkpoint_callback = ModelCheckpoint(monitor='val_recon_loss', dirpath=f'../results/{experiment_key}/checkpoints', filename='{epoch:02d}-{val_loss:.2f}', save_top_k=chckpt_save_top_k, mode='min')
     return [early_stop_callback, checkpoint_callback]
 
 
@@ -62,7 +66,7 @@ def training():
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True, num_workers=os.cpu_count())
     test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True, pin_memory=True, num_workers=os.cpu_count())
 
-    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=[model_config.name, 'RAVDESS', 'LeakyReLU', 'NEAREST', 'WAVE DISCRIMINATOR'])
+    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=['DUAL LATENT', 'RAVDESS', 'LeakyReLU', 'NEAREST', 'WAVE DISCRIMINATOR', 'GRL', 'CLASSIFIER'])
 
     trainer = Trainer(callbacks=set_up_callbacks(comet_logger.experiment.get_key()),  # https://lightning.ai/docs/pytorch/stable/common/trainer.html#
                       logger=comet_logger,
