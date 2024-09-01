@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 
 class RAVDESS(torch.utils.data.Dataset):
-    def __init__(self, root_dir, orig_freq=48000, new_freq=16000, signal_length=32768):
+    def __init__(self, root_dir, orig_freq=16000, new_freq=16000, signal_length=32768):
         self.root_dir = root_dir
         self.signal_length = signal_length
 

@@ -1,4 +1,4 @@
-from itertools import chain
+﻿from itertools import chain
 from natsort import os_sorted
 import numpy as np
 import os
@@ -7,10 +7,12 @@ from pytorch_lightning.utilities import rank_zero_only
 import torch
 from torchaudio.transforms import AmplitudeToDB, MelSpectrogram
 from torchvision.transforms import Compose
+import torchvision
 from torchmetrics.audio import PerceptualEvaluationSpeechQuality, ShortTimeObjectiveIntelligibility
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
-from models.layers import Decoder, Encoder, VectorQuantizer, DualLatentEncoder, DualLatentDecoder, CooccurencePatchDiscriminator
+from models.layers import Decoder, Encoder, VectorQuantizer, DualLatentEncoder, DualLatentDecoder, CooccurencePatchDiscriminator, PatchEncoder
+from models.layers_utils import crop_random_patch
 from models.model_utils import skip_if_sanity_checking
 
 
@@ -293,7 +295,7 @@ class DualLatentAE(VQVAE):
         x, z_q, embedding_loss, perplexity = self.encoder(x)
         x_hat = self.decoder(x, z_q)
         return x_hat, embedding_loss, perplexity
-    
+
 
 class DualLatentWithSwappingAE(VQVAE):
     def __init__(self, args_dict):
@@ -309,22 +311,24 @@ class DualLatentWithSwappingAE(VQVAE):
 
         self.decoder = DualLatentDecoder(in_dim=self.latent_dim, h_dim=self.h_dim)
         
-        self.coocDiscriminator = CooccurencePatchDiscriminator(in_dim=self.in_dim)
+        self.patch_encoder = PatchEncoder()
+        self.cooc_discriminator = CooccurencePatchDiscriminator()
         
-################### TO JEST TEN W KTÓRYM CHCE PRACOWAC
     def configure_optimizers(self):
-        # cant call .to(device) on Compose, has to be called on individual modules inside (theoretically it should move automatically, but still it creates window on CPU)
-        # we're doing it in configure_optimizers() since self.device is already known
         self.encoder.vector_quantization[1].set_device(self.device)
         for transform in self.mel_transform.transforms:
             if isinstance(transform, torch.nn.Module):
                 transform.to(self.device)
 
         optimizer_g = torch.optim.Adam(chain(self.encoder.parameters(), self.decoder.parameters()), lr=self.g_learning_rate, weight_decay=self.weight_decay)
-        optimizer_d = torch.optim.Adam(self.wave_discriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
-        optimizer_coocd = torch.optim.Adam(self.coocDiscriminator.parameters(), lr=self.d_learning_rate, weight_decay=self.weight_decay)
-        return [optimizer_g, optimizer_d, optimizer_coocd], []
+        optimizer_d = torch.optim.Adam(chain(self.patch_encoder.parameters(), self.cooc_discriminator.parameters(), self.wave_discriminator.parameters()), lr=self.d_learning_rate, weight_decay=self.weight_decay)
+        return [optimizer_g, optimizer_d], []
 
+    def crop_patches(self, image, num_patches=8):
+        patches = []
+        for _ in range(num_patches):
+            patches.append(crop_random_patch(image))
+        return torch.stack(patches)
 
     def forward(self, x12):
         x1 = x12[:, 0]
@@ -340,66 +344,92 @@ class DualLatentWithSwappingAE(VQVAE):
     def training_step(self, batch, batch_idx):
         if batch.shape[0] % 2 != 0:
             batch = batch[:-1]
-        batch = batch.view(batch.shape[0] // 2, 2, 1, batch.shape[-1])
-        optimizer_g, optimizer_d, optimizer_coocd = self.optimizers()
+        batch = batch.view(batch.shape[0] // 2, 2, 1, batch.shape[-1]).to(self.device)
+        optimizer_g, optimizer_d = self.optimizers()
+        
         x_hat1, x_hat2, embedding_loss1, embedding_loss2, perplexity1, perplexity2 = self(batch)
         embedding_loss1 *= 100
         embedding_loss2 *= 100
 
-        # train generator
+        # Train generator
         self.toggle_optimizer(optimizer_g)
         recon_loss = self.loss_fn(x_hat1, batch[:, 0]) * 100
         
         g_wave_reconstruction_fake = self.wave_discriminator(x_hat1)
         g_wave_swapping_fake = self.wave_discriminator(x_hat2)
-        g__wave_reconstruction_loss = self.disc_loss_fn(g_wave_reconstruction_fake, torch.ones_like(g_wave_reconstruction_fake))
-        g__wave_swapping_loss = self.disc_loss_fn(g_wave_swapping_fake, torch.ones_like(g_wave_swapping_fake))
-        g_wave_loss = (g__wave_reconstruction_loss + g__wave_swapping_loss) / 2
-        g_loss = recon_loss + (embedding_loss1/2) + (embedding_loss2/2) + g_wave_loss
+        g_wave_reconstruction_loss = self.disc_loss_fn(g_wave_reconstruction_fake, torch.ones_like(g_wave_reconstruction_fake))
+        g_wave_swapping_loss = self.disc_loss_fn(g_wave_swapping_fake, torch.ones_like(g_wave_swapping_fake))
+        g_wave_loss = (g_wave_reconstruction_loss + g_wave_swapping_loss) / 2
+        g_loss = (recon_loss + embedding_loss1 + embedding_loss2) + g_wave_loss
 
-        
         self.manual_backward(g_loss)
         optimizer_g.step()
         optimizer_g.zero_grad()
         self.untoggle_optimizer(optimizer_g)
 
-
-        # train discriminator
+        # Train discriminators
         x_hat1, x_hat2, *_ = self(batch)
+
+        spectrograms_real = self.mel_transform(batch[:, 0])
+        spectrograms_swapped = self.mel_transform(x_hat2)
+
         self.toggle_optimizer(optimizer_d)
 
-        d_output_reconstruction_path_real = self.wave_discriminator(batch[:, 0])
-        d_output_reconstruction_path_fake = self.wave_discriminator(x_hat1)
+        target_patches_raw = self.crop_patches(spectrograms_real)
+        target_patches = target_patches_raw.view(-1, 1, 32, 32)
+        target_features = self.patch_encoder(target_patches)
+        target_features = torch.flatten(target_features, start_dim=1)
 
-        d_output_swapp_path_real = self.wave_discriminator(batch[:, 1])
-        d_output_swapp_path_fake = self.wave_discriminator(x_hat2)
+        mix_patches = self.crop_patches(spectrograms_swapped)
+        mix_patches = mix_patches.view(-1, 1, 32, 32)
+        mix_features = self.patch_encoder(mix_patches)
+        mix_features = torch.flatten(mix_features, start_dim=1)
 
-        d_reconsctruction_loss_real = self.disc_loss_fn(d_output_reconstruction_path_real, torch.ones_like(d_output_reconstruction_path_real))
-        d_reconsctruction_loss_fake = self.disc_loss_fn(d_output_reconstruction_path_fake, torch.zeros_like(d_output_reconstruction_path_fake))
+        ref_patch = torch.mean(target_patches_raw, dim=0)
+        ref_patch = ref_patch.unsqueeze(1).repeat(1, 8, 1, 1, 1).reshape(-1, 1, 32, 32)
+        ref_features = self.patch_encoder(ref_patch)
+        ref_features = torch.flatten(ref_features, start_dim=1)
+        
+        cooc_output_target = self.cooc_discriminator(ref_features, target_features)
+        cooc_loss_target = self.disc_loss_fn(cooc_output_target, torch.ones_like(cooc_output_target))
 
-        d_swapp_loss_real = self.disc_loss_fn(d_output_swapp_path_real, torch.ones_like(d_output_swapp_path_real))
-        d_swapp_loss_fake = self.disc_loss_fn(d_output_swapp_path_fake, torch.zeros_like(d_output_swapp_path_fake))
+        cooc_output_mix = self.cooc_discriminator(ref_features, mix_features)
+        cooc_loss_mix = self.disc_loss_fn(cooc_output_mix, torch.zeros_like(cooc_output_mix))
 
-        d_reconstruction_loss = (d_reconsctruction_loss_real + d_reconsctruction_loss_fake) / 2
+        cooc_loss_d = (cooc_loss_target + cooc_loss_mix) / 2
+
+        d_output_reconstruction_real = self.wave_discriminator(batch[:, 0])
+        d_output_reconstruction_fake = self.wave_discriminator(x_hat1)
+        d_output_swapp_real = self.wave_discriminator(batch[:, 1])
+        d_output_swapp_fake = self.wave_discriminator(x_hat2)
+
+        d_reconstruction_loss_real = self.disc_loss_fn(d_output_reconstruction_real, torch.ones_like(d_output_reconstruction_real))
+        d_reconstruction_loss_fake = self.disc_loss_fn(d_output_reconstruction_fake, torch.zeros_like(d_output_reconstruction_fake))
+        d_swapp_loss_real = self.disc_loss_fn(d_output_swapp_real, torch.ones_like(d_output_swapp_real))
+        d_swapp_loss_fake = self.disc_loss_fn(d_output_swapp_fake, torch.zeros_like(d_output_swapp_fake))
+
+        d_reconstruction_loss = (d_reconstruction_loss_real + d_reconstruction_loss_fake) / 2
         d_swap_loss = (d_swapp_loss_real + d_swapp_loss_fake) / 2
         
-        d_result_loss = (d_reconstruction_loss + d_swap_loss) / 2
-        
+        d_result_loss = d_reconstruction_loss + d_swap_loss + cooc_loss_d
+
         self.manual_backward(d_result_loss)
         optimizer_d.step()
         optimizer_d.zero_grad()
         self.untoggle_optimizer(optimizer_d)
 
-        self.log_training_step_metrics(recon_loss, g_wave_loss, d_result_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, x_hat1, x_hat2, batch, batch_idx)
+        # Log metrics
+        self.log_training_step_metrics(recon_loss, g_wave_loss, d_result_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, cooc_loss_d, target_patches, mix_patches, ref_patch, x_hat1, x_hat2, batch, batch_idx)
 
 
     def validation_step(self, batch, batch_idx):
         if batch.shape[0] % 2 != 0:
             batch = batch[:-1]
-        batch = batch.view(batch.shape[0] // 2, 2, 1, batch.shape[-1])
+        batch = batch.view(batch.shape[0] // 2, 2, 1, batch.shape[-1]).to(self.device)
         x_hat1, x_hat2, embedding_loss1, embedding_loss2, perplexity1, perplexity2 = self(batch)
         recon_loss = self.loss_fn(x_hat1, batch[:,0])
 
+        # Wave discriminator calculations
         g_output_recenstruction_fake = self.wave_discriminator(x_hat1)
         g_wave_reconstruction_loss = self.disc_loss_fn(g_output_recenstruction_fake, torch.ones_like(g_output_recenstruction_fake))
 
@@ -408,6 +438,7 @@ class DualLatentWithSwappingAE(VQVAE):
         
         g_wave_loss = (g_wave_reconstruction_loss + g_wave_swapp_loss) / 2
 
+        # Discriminator loss
         d_output_reconstruction_real = self.wave_discriminator(batch[:,0])
         d_output_reconstruction_fake = self.wave_discriminator(x_hat1)
         
@@ -425,14 +456,43 @@ class DualLatentWithSwappingAE(VQVAE):
         
         d_wave_loss = (d_wave_reconstruction_loss + d_wave_swapp_loss) / 2
 
-        self.log_validation_step_metrics(recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2,  x_hat1, x_hat2, batch, batch_idx)
+        # Co-occurrence discriminator calculations
+        spectrograms_real = self.mel_transform(batch[:, 0])
+        spectrograms_swapped = self.mel_transform(x_hat2)
+
+        target_patches_raw = self.crop_patches(spectrograms_real)
+        target_patches = target_patches_raw.view(-1, 1, 32, 32)
+        target_features = self.patch_encoder(target_patches)
+        target_features = torch.flatten(target_features, start_dim=1)
+
+        mix_patches = self.crop_patches(spectrograms_swapped)
+        mix_patches = mix_patches.view(-1, 1, 32, 32)
+        mix_features = self.patch_encoder(mix_patches)
+        mix_features = torch.flatten(mix_features, start_dim=1)
+
+        ref_patch = torch.mean(target_patches_raw, dim=0)
+        ref_patch = ref_patch.unsqueeze(1).repeat(1, 8, 1, 1, 1).reshape(-1, 1, 32, 32)
+        ref_features = self.patch_encoder(ref_patch)
+        ref_features = torch.flatten(ref_features, start_dim=1)
+        
+        cooc_output_target = self.cooc_discriminator(ref_features, target_features)
+        cooc_loss_target = self.disc_loss_fn(cooc_output_target, torch.ones_like(cooc_output_target))
+
+        cooc_output_mix = self.cooc_discriminator(ref_features, mix_features)
+        cooc_loss_mix = self.disc_loss_fn(cooc_output_mix, torch.zeros_like(cooc_output_mix))
+
+        cooc_loss_d = (cooc_loss_target + cooc_loss_mix) / 2
+
+        self.log_validation_step_metrics(recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, cooc_loss_d, target_patches, mix_patches, ref_patch, x_hat1, x_hat2, batch, batch_idx)
+
 
     @torch.no_grad()
-    def log_training_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, x_hat1, x_hat2, batch, batch_idx):
+    def log_training_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, cooc_loss_d, target_patches, mix_patches, ref_patch, x_hat1, x_hat2, batch, batch_idx):
         # log loss
         self.log('train_g_recons_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
         self.log('train_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
         self.log('train_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('train_d_cooc_loss', cooc_loss_d, sync_dist=True, batch_size=self.batch_size)
 
         # log image metrics
         self.log('train_reconstruction_ssim', self.ssim(self.mel_transform(x_hat1), self.mel_transform(batch[:,0])), sync_dist=True, batch_size=self.batch_size)
@@ -443,7 +503,7 @@ class DualLatentWithSwappingAE(VQVAE):
             for metric_name, metric_func in [('train_pesq', self.pesq), ('train_stoi', self.stoi)]:
                 try:
                     self.log(metric_name+"reconstruction", metric_func(x_hat1, batch[:,0]), sync_dist=True, batch_size=self.batch_size)
-                    self.log(metric_name+"swapp", metric_func(x_hat2, batch[:,1]), sync_dist=True, batch_size=self.batch_size)
+                    self.log(metric_name+"swapp", metric_func(x_hat2, batch[:, 1]), sync_dist=True, batch_size=self.batch_size)
                 except TypeError:
                     continue
 
@@ -462,6 +522,21 @@ class DualLatentWithSwappingAE(VQVAE):
             self.logger.experiment.log_image(image_data=self.mel_transform(x_hat1[0]).to('cpu').numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_reconstructed')
             self.logger.experiment.log_image(image_data=self.mel_transform(x_hat2[0]).to('cpu').numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_swapped')
 
+            # Log the patches used for cooc discriminator
+            target_patches_first8 = target_patches[:8]
+            mix_patches_first8 = mix_patches[:8]
+            ref_patch_first8 = ref_patch[:8]
+
+            # Create grids of images for better visualization
+            target_grid = torchvision.utils.make_grid(target_patches_first8, nrow=4, normalize=True, scale_each=True)
+            mix_grid = torchvision.utils.make_grid(mix_patches_first8, nrow=4, normalize=True, scale_each=True)
+            ref_grid = torchvision.utils.make_grid(ref_patch_first8, nrow=4, normalize=True, scale_each=True)
+
+            # Log images
+            self.logger.experiment.log_image(image_data=target_grid.cpu().numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_target_patch')
+            self.logger.experiment.log_image(image_data=mix_grid.cpu().numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_swapped_patch')
+            self.logger.experiment.log_image(image_data=ref_grid.cpu().numpy(), image_channels='first', name=f'train_epoch_{self.trainer.current_epoch}_{batch_idx}_ref_patch')
+
         # Log additional metrics specific to VQVAE
         self.log('train_reconstruction_embedding_loss', embedding_loss1, sync_dist=True, batch_size=self.batch_size)
         self.log('train_swapp_embedding_loss', embedding_loss2, sync_dist=True, batch_size=self.batch_size)
@@ -470,10 +545,11 @@ class DualLatentWithSwappingAE(VQVAE):
 
     @torch.no_grad()
     @skip_if_sanity_checking
-    def log_validation_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, x_hat1, x_hat2, batch, batch_idx):
+    def log_validation_step_metrics(self, recon_loss, g_wave_loss, d_wave_loss, embedding_loss1, embedding_loss2, perplexity1, perplexity2, cooc_loss_d, target_patches, mix_patches, ref_patch, x_hat1, x_hat2, batch, batch_idx):
         self.log('val_g_recons_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
         self.log('val_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
         self.log('val_d_wave_loss', d_wave_loss, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_d_cooc_loss', cooc_loss_d, sync_dist=True, batch_size=self.batch_size)
 
         # log image metrics
         self.log('val_reconstruction_ssim', self.ssim(self.mel_transform(x_hat1), self.mel_transform(batch[:,0])), sync_dist=True, batch_size=self.batch_size)
@@ -484,7 +560,7 @@ class DualLatentWithSwappingAE(VQVAE):
             for metric_name, metric_func in [('val_pesq', self.pesq), ('val_stoi', self.stoi)]:
                 try:
                     self.log(metric_name+"reconstruction", metric_func(x_hat1, batch[:,0]), sync_dist=True, batch_size=self.batch_size)
-                    self.log(metric_name+"swapp", metric_func(x_hat2, batch[:1]), sync_dist=True, batch_size=self.batch_size)
+                    self.log(metric_name+"swapp", metric_func(x_hat2, batch[:, 1]), sync_dist=True, batch_size=self.batch_size)
                 except TypeError:
                     continue
 
@@ -501,9 +577,23 @@ class DualLatentWithSwappingAE(VQVAE):
             self.logger.experiment.log_image(image_data=self.mel_transform(x_hat1[0]).to('cpu').numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_reconstruction')
             self.logger.experiment.log_image(image_data=self.mel_transform(x_hat2[0]).to('cpu').numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_swapp')
 
+            # Log the patches used for cooc discriminator
+            target_patches_first8 = target_patches[:8]
+            mix_patches_first8 = mix_patches[:8]
+            ref_patch_first8 = ref_patch[:8]
 
-        self.log('train_reconstruction_embedding_loss', embedding_loss1, sync_dist=True, batch_size=self.batch_size)
-        self.log('train_swapp_embedding_loss', embedding_loss2, sync_dist=True, batch_size=self.batch_size)
-        self.log('train_reconstruction_perplexity', perplexity1, sync_dist=True, batch_size=self.batch_size)
-        self.log('train_swapp_perplexity', perplexity2, sync_dist=True, batch_size=self.batch_size)
+            # Create grids of images for better visualization
+            target_grid = torchvision.utils.make_grid(target_patches_first8, nrow=4, normalize=True, scale_each=True)
+            mix_grid = torchvision.utils.make_grid(mix_patches_first8, nrow=4, normalize=True, scale_each=True)
+            ref_grid = torchvision.utils.make_grid(ref_patch_first8, nrow=4, normalize=True, scale_each=True)
 
+            # Log images
+            self.logger.experiment.log_image(image_data=target_grid.cpu().numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_target_patch')
+            self.logger.experiment.log_image(image_data=mix_grid.cpu().numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_swapped_patch')
+            self.logger.experiment.log_image(image_data=ref_grid.cpu().numpy(), image_channels='first', name=f'val_epoch_{self.trainer.current_epoch}_{batch_idx}_ref_patch')
+
+        # Log additional metrics specific to VQVAE
+        self.log('val_reconstruction_embedding_loss', embedding_loss1, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_swapp_embedding_loss', embedding_loss2, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_reconstruction_perplexity', perplexity1, sync_dist=True, batch_size=self.batch_size)
+        self.log('val_swapp_perplexity', perplexity2, sync_dist=True, batch_size=self.batch_size)

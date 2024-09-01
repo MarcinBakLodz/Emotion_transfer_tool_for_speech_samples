@@ -1,5 +1,10 @@
 import torch
-
+import random
+from torchinfo import summary
+import torch
+from torchvision import transforms
+from PIL import Image
+import torchaudio
 
 # source: https://github.com/MishaLaskin/vqvae/blob/master/main.py
 class VectorQuantizer(torch.nn.Module):
@@ -337,34 +342,52 @@ class STFTDiscriminator(torch.nn.Module):
         x = torch.unsqueeze(x, dim=1)
         x = self.layers(x)
         return x
+    
+
+class PatchEncoder(torch.nn.Module):
+    def __init__(self, in_channels=1, base_channels=8):
+        super(PatchEncoder, self).__init__()
+        self.layers = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=2, padding=1),
+            torch.nn.BatchNorm2d(base_channels),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            
+            torch.nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1),
+            torch.nn.BatchNorm2d(base_channels * 2),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+
+            torch.nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, stride=2, padding=1),
+            torch.nn.BatchNorm2d(base_channels * 4),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+
+            torch.nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=3, stride=2, padding=1),
+            torch.nn.BatchNorm2d(base_channels * 8),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+
+            torch.nn.Conv2d(base_channels * 8, 192, kernel_size=2, stride=1, padding=0),
+            torch.nn.BatchNorm2d(192),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
 
 class CooccurencePatchDiscriminator(torch.nn.Module):
-    def __init__(self, in_dim= 32768, h_dim = 0):
-        self.in_dim=in_dim
-        self.h_dim=h_dim
+    def __init__(self):
         super(CooccurencePatchDiscriminator, self).__init__()
-        self.f1 = torch.nn.Linear(in_dim,15)
-        self.f2 = torch.nn.Linear(15, 1)
-    
-    def forward(self, input):
-        y = self.f1(input)
-        return self.f2(y)
 
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(384, 1024),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Linear(1024, 512),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Linear(512, 256),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Linear(256, 1)
+        )
 
-if __name__ == '__main__':
-    from torchinfo import summary
-
-    sample = torch.randn(size=(1, 1, 32768))
-
-    # enc = DualLatentEncoder(in_dim=1, h_dim=256, cont_latent_dim=16, n_e=512, vq_latent_dim=16, beta=0.25, verbose=False)
-    enc = Encoder(in_dim=1, h_dim=256, latent_dim=1)
-    summ = summary(enc, input_data=sample)
-
-    # disc = WaveDiscriminator(resolution=4, n_channels=4)
-    # summ = summary(disc, input_data=sample)
-    # out = disc(sample.to('cuda'))
-    # print(out[-1].size())
-
-    # latent = torch.randn(size=(1, 2048))
-    # dec = Decoder(in_dim=1, h_dim=32)
-    # summ2 = summary(dec, input_data=latent.to('cuda'), device='cuda')
+    def forward(self, real_features, target_or_mix_features):
+        combined_features = torch.cat([real_features, target_or_mix_features], dim=1)
+        output = self.classifier(combined_features)
+        return output
