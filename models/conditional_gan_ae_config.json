@@ -1,5 +1,5 @@
 {
-  "name": "Dual Latent",
+  "name": "Conditional GAN AE",
   "in_dim": 1,
   "h_dim": 32,
   "disc_h_dim": 32,
