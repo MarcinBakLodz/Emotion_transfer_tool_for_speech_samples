@@ -244,7 +244,7 @@ class DualLatentDecoder(Decoder):
 
 class ConditionalDualLatentDecoder(torch.nn.Module):
     def __init__(self, in_dim, h_dim):
-        super().__init__(in_dim, h_dim)
+        super().__init__()
 
     def forward(self, x, z_q, label):
         print(f'[ConditionalDualLatentDecoder] x.shape: {x.shape}, z_q.shape: {z_q.shape}')

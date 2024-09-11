@@ -3,6 +3,7 @@
   "in_dim": 1,
   "h_dim": 32,
   "disc_h_dim": 32,
+  "wave_disc_h_dim": 32,
   "cont_latent_dim": 1,
   "vq_latent_dim": 4,
   "latent_dim": 5,
@@ -14,3 +15,4 @@
   "batch_size": 64,
   "sr": 16000
 }
+

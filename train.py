@@ -14,7 +14,7 @@ from utils import get_parser_from_json
 
 def get_dset(train_share=0.8):
     # dset = VCTK(root_dir='../data')
-    dset = RAVDESS(root_dir='./data/RAVDESS')
+    dset = RAVDESS(root_dir='C:\\Users\\Marcin\\Desktop\\Studia\\Transfer_Emocji\\data\\RAVDESS\\Wave')
     train_size = int(train_share * len(dset))
     test_size = len(dset) - train_size
     return torch.utils.data.random_split(dataset=dset, lengths=[train_size, test_size], generator=torch.Generator().manual_seed(42))  # fix the generator for reproducible results

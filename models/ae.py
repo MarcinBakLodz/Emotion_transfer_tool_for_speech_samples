@@ -26,15 +26,14 @@ class AE(LightningModule):
         self.encoder = Encoder(in_dim=self.in_dim, h_dim=self.h_dim, latent_dim=self.latent_dim)
         self.decoder = Decoder(in_dim=self.latent_dim, h_dim=self.h_dim)
 
-        if self.use_wave_disc:
-            self.wave_discriminator = torch.nn.Sequential(
-                Encoder(in_dim=self.in_dim, h_dim=self.wave_disc_h_dim, latent_dim=self.latent_dim),
-                torch.nn.AdaptiveAvgPool1d(1),  # Reduce feature map size to 1
-                torch.nn.Flatten()  # Remove extra dimensions
-            )
+        self.wave_discriminator = torch.nn.Sequential(
+            Encoder(in_dim=self.in_dim, h_dim=self.wave_disc_h_dim, latent_dim=self.latent_dim),
+            torch.nn.AdaptiveAvgPool1d(1),  # Reduce feature map size to 1
+            torch.nn.Flatten()  # Remove extra dimensions
+        )
 
-        if self.use_stft_disc:
-            self.stft_discriminator = STFTDiscriminator(h_dim=self.stft_disc_h_dim)
+        # if self.use_stft_disc:
+        #     self.stft_discriminator = STFTDiscriminator(h_dim=self.stft_disc_h_dim)
 
         self.mel_transform = Compose([
             MelSpectrogram(sample_rate=self.sr, n_fft=1024, hop_length=128, n_mels=128),
