@@ -541,7 +541,7 @@ class ConditionalGANAE(VQVAE):
                                          n_e=self.n_e,
                                          beta=self.beta)   
         
-        self.decoder = ConditionalDualLatentDecoder(in_dim=self.latent_dim, h_dim=self.h_dim)
+        self.decoder = ConditionalDualLatentDecoder(in_dim=1, h_dim=self.h_dim)
 
     def configure_optimizers(self):
         self.encoder.vector_quantization[1].set_device(self.device)
@@ -629,7 +629,7 @@ class ConditionalGANAE(VQVAE):
 
     def validation_step(self, batch, batch_idx):
         x, y_true = batch
-        x_hat, embedding_loss, perplexity, z_q, label = self(x)
+        x_hat, embedding_loss, perplexity, z_q = self(x, y_true)
         mel_x, mel_x_hat = self.mel_transform(x), self.mel_transform(x_hat)
 
         recon_loss = self.loss_fn(x_hat, x)
