@@ -13,6 +13,8 @@
   "d_learning_rate": 3e-6,
   "weight_decay": 1e-6,
   "batch_size": 64,
-  "sr": 16000
+  "sr": 16000,
+  "use_wave_disc": true,
+  "use_stft_disc": false
 }
 

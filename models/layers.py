@@ -241,34 +241,35 @@ class DualLatentDecoder(Decoder):
     def forward(self, x, z_q):
         return self.inverse_conv_stack(torch.concatenate((x, z_q), dim=1))
     
-class ConditionalDualLatentDecoder(Decoder):
-    def __init__(self, in_dim, h_dim):
-        super().__init__(in_dim, h_dim)
-        self.z_q_flatten = torch.nn.Flatten()
-
-    def forward(self, x, z_q, label):
-        z_q = self.z_q_flatten(z_q)
-        z_q = z_q.unsqueeze(1)
-        label = torch.nn.functional.one_hot(label, num_classes=8)
-        label = label.unsqueeze(1)
-        print(f'[ConditionalDualLatentDecoder] x.shape: {x.shape}, z_q.shape: {z_q.shape}, label.shape: {label.shape}')
-        return self.inverse_conv_stack(torch.concatenate((x, z_q, label), dim=2))
-
 # class ConditionalDualLatentDecoder(Decoder):
 #     def __init__(self, in_dim, h_dim):
 #         super().__init__(in_dim, h_dim)
-#         self.label_encoder = torch.nn.Sequential(
-#             torch.nn.Linear(8, 2048),
-#             torch.nn.LeakyReLU())
-
+#         self.z_q_flatten = torch.nn.Flatten()
 
 #     def forward(self, x, z_q, label):
-#         print(f'[ConditionalDualLatentDecoder] x.shape: {x.shape}, z_q.shape: {z_q.shape}, label.shape: {label.shape}')
+#         z_q = self.z_q_flatten(z_q)
+#         z_q = z_q.unsqueeze(1)
 #         label = torch.nn.functional.one_hot(label, num_classes=8)
-#         label = self.label_encoder(label)
 #         label = label.unsqueeze(1)
+#         print(f'[ConditionalDualLatentDecoder] x.shape: {x.shape}, z_q.shape: {z_q.shape}, label.shape: {label.shape}')
+#         return self.inverse_conv_stack(torch.concatenate((x, z_q, label), dim=2))
 
-#         return self.inverse_conv_stack(torch.concatenate((x, z_q, label), dim=1))
+class ConditionalDualLatentDecoder(Decoder):
+    def __init__(self, in_dim, h_dim):
+        super().__init__(in_dim, h_dim)
+        self.label_encoder = torch.nn.Sequential(
+            torch.nn.Linear(8, 2048),
+            torch.nn.LeakyReLU())
+
+
+    def forward(self, x, z_q, label):
+        # print(f'[ConditionalDualLatentDecoder] x.shape: {x.shape}, z_q.shape: {z_q.shape}, label.shape: {label.shape}')
+        # print("tu jest git")
+        label = torch.nn.functional.one_hot(label, num_classes=8).float()
+        label = self.label_encoder(label)
+        label = label.unsqueeze(1)
+
+        return self.inverse_conv_stack(torch.concatenate((x, z_q, label), dim=1))
 
 
     

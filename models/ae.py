@@ -541,7 +541,7 @@ class ConditionalGANAE(VQVAE):
                                          n_e=self.n_e,
                                          beta=self.beta)   
         
-        self.decoder = ConditionalDualLatentDecoder(in_dim=1, h_dim=self.h_dim)
+        self.decoder = ConditionalDualLatentDecoder(in_dim=self.latent_dim + 1, h_dim=self.h_dim) # + 1 bo klasa
 
     def configure_optimizers(self):
         self.encoder.vector_quantization[1].set_device(self.device)
@@ -573,7 +573,7 @@ class ConditionalGANAE(VQVAE):
 
         # train generator
         self.toggle_optimizer(optimizer_g)
-        x_hat, embedding_loss, perplexity, z_q = self(x)
+        x_hat, embedding_loss, perplexity, z_q = self(x, y_true)
         recon_loss = self.loss_fn(x_hat, x)
 
         g_wave_loss, g_stft_loss = 0, 0
@@ -596,7 +596,7 @@ class ConditionalGANAE(VQVAE):
         # d_wave_loss, d_stft_loss, r1_wave_penalty, r1_stft_penalty = 0, 0, 0, 0
         d_wave_loss, d_stft_loss = 0, 0
         if optimizer_d:
-            x_hat, embedding_loss, perplexity, z_q = self(x)
+            x_hat, embedding_loss, perplexity, z_q = self(x, y_true)
             mel_x, mel_x_hat = self.mel_transform(x), self.mel_transform(x_hat)
             self.toggle_optimizer(optimizer_d)
 
@@ -656,7 +656,7 @@ class ConditionalGANAE(VQVAE):
             d_stft_loss_fake = self.disc_loss_fn(d_output_fake_stft, torch.zeros_like(d_output_fake_stft))
             d_stft_loss = (d_stft_loss_real + d_stft_loss_fake) / 2
 
-        self.log_step_metrics(recon_loss, g_wave_loss, g_stft_loss, d_wave_loss, d_stft_loss, embedding_loss, perplexity, 0, 0, x_hat, x, z_q, y_true, batch_idx, step_name='val')
+        self.log_step_metrics(recon_loss, g_wave_loss, g_stft_loss, d_wave_loss, d_stft_loss, embedding_loss, perplexity, x_hat, x, z_q, y_true, batch_idx, step_name='val')
 
     # @torch.no_grad()
     # @skip_if_sanity_checking
@@ -668,7 +668,7 @@ class ConditionalGANAE(VQVAE):
 
     @torch.no_grad()
     @skip_if_sanity_checking
-    def log_step_metrics(self, recon_loss, g_wave_loss, g_stft_loss, d_wave_loss, d_stft_loss, x_hat, x, z_q, label, batch_idx, step_name):
+    def log_step_metrics(self, recon_loss, g_wave_loss, g_stft_loss, d_wave_loss, d_stft_loss, embedding, perplexity, x_hat, x, z_q, label, batch_idx, step_name):
         # log loss
         self.log(f'{step_name}_g_recons_loss', recon_loss, sync_dist=True, batch_size=self.batch_size)
         self.log(f'{step_name}_g_wave_loss', g_wave_loss, sync_dist=True, batch_size=self.batch_size)
@@ -695,8 +695,12 @@ class ConditionalGANAE(VQVAE):
             self.logger.experiment.log_image(image_data=self.mel_transform(x_hat[0]).to('cpu').numpy(), image_channels='first', name=f'{step_name}_epoch_{self.trainer.current_epoch}_{batch_idx}_pred')
 
             for emotion in range(8):
-                x_hat, *_ = self.decoder(x, z_q, emotion)
-                self.logger.experiment.log_audio(audio_data=x_hat[0][0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'{step_name}_epoch_{self.trainer.current_epoch}_{batch_idx}_emotion{emotion}.wav')
+                emotion = torch.tensor([emotion]).to(self.device)
+                # emotion = torch.nn.functional.one_hot(emotion, num_classes=8).float()
+                code, z_q, *_ = self.encoder(x[0].unsqueeze(0))
+                # print(f"[logging] code: {code.shape}, z_q: {z_q.shape}, emotion: {emotion.shape}")
+                x_hat, *_ = self.decoder(code, z_q, emotion)
+                self.logger.experiment.log_audio(audio_data=x_hat[0].to('cpu').numpy().astype(np.float32), sample_rate=self.sr, file_name=f'{step_name}_epoch_{self.trainer.current_epoch}_{batch_idx}_emotion{emotion}.wav')
 
     @rank_zero_only  # needed for self.logger.experiment.get_key() to work properly when using >1 GPUs
     def log_best_checkpoint(self):

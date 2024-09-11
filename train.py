@@ -67,7 +67,7 @@ def training():
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True)
     test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True, pin_memory=True)
 
-    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=[model_config.name, 'RAVDESS', 'WAVE DISCRIMINATOR', 'CONDITIONAL'])
+    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=[model_config.name, 'WAVE DISCRIMINATOR', 'LABEL EMBEDDING'])
 
     trainer = Trainer(callbacks=set_up_callbacks(comet_logger.experiment.get_key()),  # https://lightning.ai/docs/pytorch/stable/common/trainer.html#
                       logger=comet_logger,
