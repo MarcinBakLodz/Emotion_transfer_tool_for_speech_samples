@@ -1,4 +1,4 @@
-import comet_ml  # this needs to be imported before torch, that's how comet_ml works for some reason
+﻿import comet_ml  # this needs to be imported before torch, that's how comet_ml works for some reason
 import os
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -8,20 +8,25 @@ from torchinfo import summary
 
 from datasets.ravdess import RAVDESS
 from datasets.vctk import VCTK
-from models.ae import AE, VQVAE, DualLatentAE
+from models.ae import AE, VQVAE, DualLatentWithSwappingAE, ConditionalGANAE
 from utils import get_parser_from_json
 
 
 def get_dset(train_share=0.8):
     # dset = VCTK(root_dir='../data')
-    dset = RAVDESS(root_dir='../data/RAVDESS')
+    dset = RAVDESS(root_dir='./data/RAVDESS')
     train_size = int(train_share * len(dset))
     test_size = len(dset) - train_size
     return torch.utils.data.random_split(dataset=dset, lengths=[train_size, test_size], generator=torch.Generator().manual_seed(42))  # fix the generator for reproducible results
 
+def get_comet_config(file_path):
+    with open(file_path, 'r') as file:
+        file_content = file.read().splitlines()
+    return file_content[0], file_content[1]  # API key, Project name
 
 def set_up_comet_logger(model, model_config, test_sample, tags):
-    comet_logger = CometLogger()  # https://www.comet.com/docs/v2/api-and-sdk/python-sdk/reference/Experiment/
+    api_key, project_name = get_comet_config("./comet_config_Marcin.txt")
+    comet_logger = CometLogger(api_key=api_key, project_name=project_name)  # https://www.comet.com/docs/v2/api-and-sdk/python-sdk/reference/Experiment/
     comet_logger.log_hyperparams(vars(model_config))
 
     for tag in tags:
@@ -42,7 +47,7 @@ def set_up_comet_logger(model, model_config, test_sample, tags):
     comet_logger.experiment.log_parameter(name="n_params", value=total_params)
 
     # log summary
-    summ = summary(model=model, input_data=test_sample.to(next(model.parameters()).device), device=next(model.parameters()).device, verbose=0)
+    summ = summary(model=model, input_data=test_sample, device=next(model.parameters()).device, verbose=0)
     comet_logger.experiment.set_model_graph(graph=f"{model.__repr__()}\n\n{summ}")
 
     return comet_logger
@@ -55,19 +60,19 @@ def set_up_callbacks(experiment_key, es_min_delta=1e-9, es_patience=100, chckpt_
 
 
 def training():
-    model_config = get_parser_from_json('models/dual_latent_ae_config.json')
-    model = DualLatentAE(args_dict=vars(model_config))
+    model_config = get_parser_from_json('models/conditional_gan_ae_config.json')
+    model = ConditionalGANAE(args_dict=vars(model_config))
 
     train_dataset, test_dataset = get_dset()
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True, num_workers=os.cpu_count())
-    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True, pin_memory=True, num_workers=os.cpu_count())
+    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=model_config.batch_size, shuffle=True, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=model_config.batch_size, drop_last=True, pin_memory=True)
 
-    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=[model_config.name, 'RAVDESS', 'LeakyReLU', 'NEAREST', 'WAVE DISCRIMINATOR'])
+    comet_logger = set_up_comet_logger(model=model, model_config=model_config, test_sample=next(iter(test_loader)), tags=[model_config.name, 'WAVE DISCRIMINATOR', 'LABEL EMBEDDING'])
 
     trainer = Trainer(callbacks=set_up_callbacks(comet_logger.experiment.get_key()),  # https://lightning.ai/docs/pytorch/stable/common/trainer.html#
                       logger=comet_logger,
                       log_every_n_steps=10,
-                      accelerator='auto',
+                      accelerator='cuda',
                       devices='auto',
                       precision='32-true',
                       max_epochs=1000)

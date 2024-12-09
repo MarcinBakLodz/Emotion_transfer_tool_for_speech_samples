@@ -9,6 +9,6 @@
   "g_learning_rate": 3e-4,
   "d_learning_rate": 3e-4,
   "weight_decay": 1e-6,
-  "batch_size": 16,
+  "batch_size": 2,
   "sr": 16000
 }

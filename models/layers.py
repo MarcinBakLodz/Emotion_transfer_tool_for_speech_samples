@@ -1,5 +1,10 @@
 import torch
-
+import random
+from torchinfo import summary
+import torch
+from torchvision import transforms
+from PIL import Image
+import torchaudio
 
 # source: https://github.com/MishaLaskin/vqvae/blob/master/main.py
 class VectorQuantizer(torch.nn.Module):
@@ -197,6 +202,9 @@ class Decoder(torch.nn.Module):
         return self.inverse_conv_stack(x)
 
 
+
+
+
 class DualLatentEncoder(torch.nn.Module):
     def __init__(self, in_dim, h_dim, cont_latent_dim, vq_latent_dim, n_e, beta):
         super().__init__()
@@ -232,8 +240,39 @@ class DualLatentDecoder(Decoder):
 
     def forward(self, x, z_q):
         return self.inverse_conv_stack(torch.concatenate((x, z_q), dim=1))
+    
+# class ConditionalDualLatentDecoder(Decoder):
+#     def __init__(self, in_dim, h_dim):
+#         super().__init__(in_dim, h_dim)
+#         self.z_q_flatten = torch.nn.Flatten()
+
+#     def forward(self, x, z_q, label):
+#         z_q = self.z_q_flatten(z_q)
+#         z_q = z_q.unsqueeze(1)
+#         label = torch.nn.functional.one_hot(label, num_classes=8)
+#         label = label.unsqueeze(1)
+#         print(f'[ConditionalDualLatentDecoder] x.shape: {x.shape}, z_q.shape: {z_q.shape}, label.shape: {label.shape}')
+#         return self.inverse_conv_stack(torch.concatenate((x, z_q, label), dim=2))
+
+class ConditionalDualLatentDecoder(Decoder):
+    def __init__(self, in_dim, h_dim):
+        super().__init__(in_dim, h_dim)
+        self.label_encoder = torch.nn.Sequential(
+            torch.nn.Linear(8, 2048),
+            torch.nn.LeakyReLU())
 
 
+    def forward(self, x, z_q, label):
+        # print(f'[ConditionalDualLatentDecoder] x.shape: {x.shape}, z_q.shape: {z_q.shape}, label.shape: {label.shape}')
+        # print("tu jest git")
+        label = torch.nn.functional.one_hot(label, num_classes=8).float()
+        label = self.label_encoder(label)
+        label = label.unsqueeze(1)
+
+        return self.inverse_conv_stack(torch.concatenate((x, z_q, label), dim=1))
+
+
+    
 # TODO: INTEGRATE AND TEST DISCRIMINATORS
 # source: https://github.com/kaiidams/soundstream-pytorch/blob/main/soundstream.py
 class WaveDiscriminator(torch.nn.Module):
@@ -337,22 +376,47 @@ class STFTDiscriminator(torch.nn.Module):
         x = torch.unsqueeze(x, dim=1)
         x = self.layers(x)
         return x
+    
+
+class PatchEncoder(torch.nn.Module):
+    def __init__(self, in_channels=1, base_channels=16):
+        super(PatchEncoder, self).__init__()
+        self.layers = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, base_channels, kernel_size=5, stride=4, padding=1),
+            torch.nn.BatchNorm2d(base_channels),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            
+            torch.nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1),
+            torch.nn.BatchNorm2d(base_channels * 2),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+
+            torch.nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, stride=2, padding=1),
+            torch.nn.BatchNorm2d(base_channels * 4),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+        )
+    
+    def forward(self, x):
+        # print(x.shape)
+        x = self.layers(x)
+        # print(x.shape)
+        return x
 
 
-if __name__ == '__main__':
-    from torchinfo import summary
+class CooccurencePatchDiscriminator(torch.nn.Module):
+    def __init__(self):
+        super(CooccurencePatchDiscriminator, self).__init__()
 
-    sample = torch.randn(size=(1, 1, 32768))
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(512, 64),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Linear(64, 32),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Linear(32, 16),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Linear(16, 1)
+        )
 
-    # enc = DualLatentEncoder(in_dim=1, h_dim=256, cont_latent_dim=16, n_e=512, vq_latent_dim=16, beta=0.25, verbose=False)
-    enc = Encoder(in_dim=1, h_dim=256, latent_dim=1)
-    summ = summary(enc, input_data=sample)
-
-    # disc = WaveDiscriminator(resolution=4, n_channels=4)
-    # summ = summary(disc, input_data=sample)
-    # out = disc(sample.to('cuda'))
-    # print(out[-1].size())
-
-    # latent = torch.randn(size=(1, 2048))
-    # dec = Decoder(in_dim=1, h_dim=32)
-    # summ2 = summary(dec, input_data=latent.to('cuda'), device='cuda')
+    def forward(self, real_features, target_or_mix_features):
+        combined_features = torch.cat([real_features, target_or_mix_features], dim=1)
+        output = self.classifier(combined_features)
+        return output
